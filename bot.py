@@ -19,6 +19,7 @@ import admin_panel
 import database as db
 import i18n
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,6 +35,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 LOGIN_EMAIL = os.getenv("LOGIN_EMAIL", "")
 LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "")
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+IMPERSONATE = os.getenv("CURL_IMPERSONATE", "chrome120")
+
+LOGGED_IN_MARKERS = (
+    "my account", "sign out", "log out", "account-management",
+    "welcome back", "your orders", "sign-out",
+)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -217,62 +225,147 @@ def base_card_data(cc: str, guid: str) -> dict:
 
 
 # ========== AUTO LOGIN ==========
-def do_login() -> bool:
-    global dobies_session
-    log.info("جاري تسجيل الدخول للحصول على كوكيز جديدة...")
+def _new_session() -> curl_requests.Session:
+    kwargs: dict = {"impersonate": IMPERSONATE}
+    if PROXY_URL:
+        kwargs["proxies"] = {"http": PROXY_URL, "https": PROXY_URL}
+    return curl_requests.Session(**kwargs)
 
-    session = curl_requests.Session(impersonate="chrome120")
-    headers = {
+
+def _browser_headers(referer: str | None = None) -> dict:
+    hdrs = {
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "en-GB,en;q=0.9",
-        "origin": DOBIES_BASE,
-        "referer": f"{DOBIES_BASE}/sign-in",
         "user-agent": CHECKOUT_HEADERS["user-agent"],
     }
+    if referer:
+        hdrs["referer"] = referer
+    return hdrs
+
+
+def _parse_hidden_fields(html: str) -> dict:
+    fields: dict[str, str] = {}
+    for tag in re.findall(r"<input[^>]+>", html, re.I):
+        if 'type="hidden"' not in tag.lower() and "type='hidden'" not in tag.lower():
+            continue
+        name_m = re.search(r'name=["\']([^"\']+)["\']', tag, re.I)
+        if not name_m:
+            continue
+        val_m = re.search(r'value=["\']([^"\']*)["\']', tag, re.I)
+        fields[name_m.group(1)] = val_m.group(1) if val_m else ""
+    return fields
+
+
+def _is_logged_in(html: str, url: str = "") -> bool:
+    low = html.lower()
+    if any(marker in low for marker in LOGGED_IN_MARKERS):
+        return True
+    if url and "sign-in" not in url.lower() and "account" in url.lower():
+        return True
+    return False
+
+
+def _fetch_checkout_guid(session: curl_requests.Session) -> str | None:
+    resp = session.get(
+        f"{DOBIES_BASE}/checkout/delivery",
+        headers={
+            **_browser_headers(f"{DOBIES_BASE}/"),
+            "cache-control": "max-age=0",
+            "upgrade-insecure-requests": "1",
+        },
+        timeout=30,
+    )
+    match = re.search(r"card\.html\?guid=([\w-]+)", resp.text)
+    if match:
+        return match.group(1)
+    log.warning(
+        "GUID not in checkout page — status=%s len=%d",
+        resp.status_code,
+        len(resp.text),
+    )
+    return None
+
+
+def do_login() -> bool:
+    global dobies_session
+    if not LOGIN_EMAIL or not LOGIN_PASSWORD:
+        log.error("LOGIN_EMAIL أو LOGIN_PASSWORD غير مضبوطين في المتغيرات")
+        return False
+
+    log.info("جاري تسجيل الدخول... (proxy=%s)", "yes" if PROXY_URL else "no")
+    session = _new_session()
+    base_hdrs = _browser_headers()
 
     try:
-        session.get(DOBIES_BASE + "/", headers=headers, timeout=20)
-        time.sleep(0.8)
-        session.get(f"{DOBIES_BASE}/sign-in", headers=headers, timeout=20)
-        time.sleep(0.8)
+        session.get(DOBIES_BASE + "/", headers=base_hdrs, timeout=30)
+        time.sleep(1)
 
-        session.post(
-            f"{DOBIES_BASE}/sign-in",
-            headers=headers,
-            data={"EmailAddress": LOGIN_EMAIL, "Password": LOGIN_PASSWORD},
-            allow_redirects=True,
-            timeout=20,
+        sign_in_url = f"{DOBIES_BASE}/sign-in"
+        sign_in_page = session.get(
+            sign_in_url,
+            headers=_browser_headers(DOBIES_BASE + "/"),
+            timeout=30,
         )
-        time.sleep(0.8)
+        time.sleep(0.5)
+
+        if sign_in_page.status_code >= 400:
+            log.error("sign-in page HTTP %s", sign_in_page.status_code)
+            return False
+
+        form_data = _parse_hidden_fields(sign_in_page.text)
+        form_data.update({
+            "EmailAddress": LOGIN_EMAIL,
+            "Password": LOGIN_PASSWORD,
+        })
+
+        login_resp = session.post(
+            sign_in_url,
+            headers={
+                **_browser_headers(sign_in_url),
+                "content-type": "application/x-www-form-urlencoded",
+                "origin": DOBIES_BASE,
+            },
+            data=form_data,
+            allow_redirects=True,
+            timeout=30,
+        )
+        time.sleep(1)
 
         account = session.get(
             f"{DOBIES_BASE}/account-management",
-            headers={**headers, "referer": f"{DOBIES_BASE}/sign-in"},
-            timeout=20,
+            headers=_browser_headers(sign_in_url),
+            timeout=30,
         )
 
-        if "My Account" not in account.text:
-            log.error("فشل تسجيل الدخول")
+        if not _is_logged_in(account.text, str(account.url)):
+            snippet = re.sub(r"\s+", " ", account.text[:300])
+            log.error(
+                "فشل تسجيل الدخول — status=%s url=%s snippet=%s",
+                account.status_code,
+                account.url,
+                snippet[:200],
+            )
+            if "captcha" in account.text.lower() or "cloudflare" in account.text.lower():
+                log.error("الموقع يطلب CAPTCHA/Cloudflare — جرّب PROXY_URL على Railway")
             return False
 
         log.info("جاري إضافة منتج للسلة...")
         session.post(
             f"{DOBIES_BASE}/cart-JSON.cfm",
             headers={
-                **headers,
+                **_browser_headers(f"{DOBIES_BASE}/SUSGW2/peony-pink-hawaiian-coral_mh-76854"),
                 "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "referer": f"{DOBIES_BASE}/SUSGW2/peony-pink-hawaiian-coral_mh-76854",
                 "x-requested-with": "XMLHttpRequest",
             },
             data=(
                 "Quantity=1&addtobasket=1&prodcode=MH322"
                 "&name=Carrot+'Autumn+King+2'+-+Seeds&sku=433811"
             ),
-            timeout=20,
+            timeout=30,
         )
 
         dobies_session = session
-        log.info("تسجيل الدخول ناجح")
+        log.info("تسجيل الدخول ناجح — cookies=%d", len(session.cookies))
         return True
 
     except Exception as exc:
@@ -280,33 +373,30 @@ def do_login() -> bool:
         return False
 
 
-def get_cookies_dict() -> dict:
+def ensure_session() -> curl_requests.Session | None:
     global dobies_session
-    if dobies_session is None:
-        do_login()
-    return dict(dobies_session.cookies) if dobies_session else {}
+    if dobies_session is None and not do_login():
+        return None
+    return dobies_session
 
 
-async def get_guid_with_retry(loop, stats: dict, max_retries: int = 2) -> str | None:
+async def get_guid_with_retry(loop, stats: dict, max_retries: int = 3) -> str | None:
     for attempt in range(max_retries):
-        cookies = get_cookies_dict()
-        resp = await loop.run_in_executor(
-            None,
-            lambda: curl_requests.get(
-                f"{DOBIES_BASE}/checkout/delivery",
-                cookies=cookies,
-                headers=CHECKOUT_HEADERS,
-                impersonate="chrome120",
-                timeout=30,
-            ),
-        )
+        session = await loop.run_in_executor(None, ensure_session)
+        if not session:
+            log.warning("لا توجد جلسة — محاولة %d/%d", attempt + 1, max_retries)
+            stats["last_response"] = f"guid_retry:{attempt + 1}"
+            await asyncio.sleep(2)
+            continue
 
-        match = re.search(r"card\.html\?guid=([\w-]+)", resp.text)
-        if match:
-            return match.group(1)
+        guid = await loop.run_in_executor(None, lambda s=session: _fetch_checkout_guid(s))
+        if guid:
+            return guid
 
         log.warning("فشل جلب GUID — محاولة %d/%d", attempt + 1, max_retries)
         stats["last_response"] = f"guid_retry:{attempt + 1}"
+        global dobies_session
+        dobies_session = None
         await loop.run_in_executor(None, do_login)
         await asyncio.sleep(2)
 
@@ -509,6 +599,8 @@ async def update_dashboard(bot_app, user_id: int) -> None:
             reply_markup=create_dashboard_keyboard(user_id),
             parse_mode="Markdown",
         )
+    except BadRequest:
+        pass
     except Exception:
         pass
 
