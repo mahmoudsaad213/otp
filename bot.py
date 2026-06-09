@@ -426,6 +426,20 @@ def _btn(text: str, callback: str = "noop", style: str | None = None) -> InlineK
     return InlineKeyboardButton(**kwargs)
 
 
+def _url_btn(text: str, url: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, url=url)
+
+
+def build_welcome_text(user_id: int) -> str:
+    mx = get_max_cards(user_id)
+    return (
+        f"{i18n.t(user_id, 'welcome_title')}\n\n"
+        f"{i18n.t(user_id, 'welcome_about')}\n\n"
+        f"{i18n.t(user_id, 'welcome_body', max=mx)}\n\n"
+        f"{i18n.t(user_id, 'links_block')}"
+    )
+
+
 def _dash_status(user_id: int, stats: dict) -> tuple[str, str]:
     if stats["last_response"] == "completed":
         return i18n.t(user_id, "status_completed"), "success"
@@ -532,6 +546,11 @@ def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     ]
     if admin_panel.is_admin(user_id):
         rows.append([_btn(i18n.t(user_id, "btn_admin"), "adm:main", "danger")])
+    rows.append([
+        _url_btn(i18n.t(user_id, "btn_channel"), i18n.LINK_CHANNEL),
+        _url_btn(i18n.t(user_id, "btn_owner"), i18n.LINK_OWNER),
+    ])
+    rows.append([_url_btn(i18n.t(user_id, "btn_chat"), i18n.LINK_CHAT)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -544,11 +563,11 @@ async def show_language_picker(update: Update) -> None:
 
 
 async def show_main_menu(update: Update, user_id: int) -> None:
-    mx = get_max_cards(user_id)
     await update.effective_message.reply_text(
-        f"{i18n.t(user_id, 'welcome_title')}\n\n{i18n.t(user_id, 'welcome_body', max=mx)}",
+        build_welcome_text(user_id),
         reply_markup=main_menu_keyboard(user_id),
         parse_mode="Markdown",
+        disable_web_page_preview=True,
     )
 
 
@@ -861,11 +880,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "back_menu":
         await query.answer()
-        mx = get_max_cards(user_id)
         await query.edit_message_text(
-            f"{i18n.t(user_id, 'welcome_title')}\n\n{i18n.t(user_id, 'welcome_body', max=mx)}",
+            build_welcome_text(user_id),
             reply_markup=main_menu_keyboard(user_id),
             parse_mode="Markdown",
+            disable_web_page_preview=True,
         )
         return
 

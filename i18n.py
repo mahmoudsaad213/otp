@@ -7,13 +7,27 @@ import database as db
 LANGS = ("ar", "en")
 DEFAULT_LANG = "ar"
 
+LINK_CHANNEL = "https://t.me/mstoolvip"
+LINK_OWNER = "https://t.me/FastSpeedtest"
+LINK_CHAT = "https://t.me/facebook_method_tool"
+
 TEXTS: dict[str, dict[str, str]] = {
     "ar": {
         "choose_language": "🌍 *اختر لغتك*\n\nChoose your language:",
         "language_set_ar": "✅ تم تعيين اللغة: *العربية*",
         "language_set_en": "✅ Language set: *English*",
         "welcome_title": "🚀 *DOBIES CC CHECKER*",
+        "welcome_about": "بوت فحص كروت سريع — لوحة حية وإشعار *3D LIVE* فوري.",
         "welcome_body": "أرسل ملف `.txt` أو الصق الكروت مباشرة.\nالحد الأقصى *{max}* كرت — فحص كرت كرت.",
+        "links_block": (
+            "━━━━━━━━━━━━━━\n"
+            "📢 [قناة الأدوات والتحديثات](https://t.me/mstoolvip)\n"
+            "👤 [المالك](https://t.me/FastSpeedtest)\n"
+            "💬 [الشات الجماعي](https://t.me/facebook_method_tool)"
+        ),
+        "btn_channel": "📢 الأدوات",
+        "btn_owner": "👤 المالك",
+        "btn_chat": "💬 الشات",
         "help": (
             "📖 *دليل الاستخدام*\n\n"
             "📄 أرسل ملف `.txt` أو الصق الكروت في رسالة\n"
@@ -94,7 +108,17 @@ TEXTS: dict[str, dict[str, str]] = {
         "language_set_ar": "✅ Language set: *Arabic*",
         "language_set_en": "✅ Language set: *English*",
         "welcome_title": "🚀 *DOBIES CC CHECKER*",
+        "welcome_about": "Fast card checker — live dashboard & instant *3D LIVE* alerts.",
         "welcome_body": "Send a `.txt` file or paste cards directly.\nMax *{max}* cards — one-by-one checking.",
+        "links_block": (
+            "━━━━━━━━━━━━━━\n"
+            "📢 [Tools & Updates](https://t.me/mstoolvip)\n"
+            "👤 [Owner](https://t.me/FastSpeedtest)\n"
+            "💬 [Group Chat](https://t.me/facebook_method_tool)"
+        ),
+        "btn_channel": "📢 Tools",
+        "btn_owner": "👤 Owner",
+        "btn_chat": "💬 Chat",
         "help": (
             "📖 *User Guide*\n\n"
             "📄 Send a `.txt` file or paste cards in a message\n"
