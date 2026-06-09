@@ -102,6 +102,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "err_max_cards": "⚠️ الحد الأقصى `{max}` كرت في المرة.",
         "err_daily_limit": "📅 تجاوزت الحد اليومي `{limit}` كرت.\nالمتبقي: `{remaining}`",
         "ban_default_reason": "مخالفة القواعد",
+        "err_queue_full": "⏳ السيرفر مزدحم ({active}/{max}) — حاول بعد دقيقة.",
     },
     "en": {
         "choose_language": "🌍 *Choose your language*\n\nاختر لغتك:",
@@ -193,6 +194,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "err_max_cards": "⚠️ Max `{max}` cards per session.",
         "err_daily_limit": "📅 Daily limit `{limit}` exceeded.\nRemaining: `{remaining}`",
         "ban_default_reason": "Rule violation",
+        "err_queue_full": "⏳ Server busy ({active}/{max}) — try again in a minute.",
     },
 }
 

