@@ -15,6 +15,9 @@ from pathlib import Path
 from curl_cffi import requests as curl_requests
 import requests
 from dotenv import load_dotenv
+import admin_panel
+import database as db
+import i18n
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -31,8 +34,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 LOGIN_EMAIL = os.getenv("LOGIN_EMAIL", "")
 LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "")
-MAX_CARDS_PER_CHECK = 100
-CARD_DELAY_SEC = 1.0
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -86,6 +87,66 @@ def format_elapsed(seconds: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def track_user(update: Update) -> None:
+    user = update.effective_user
+    if user:
+        db.upsert_user(user.id, user.username, user.first_name, user.last_name)
+
+
+def user_can_check(user_id: int, cards_count: int = 0) -> tuple[bool, str]:
+    if admin_panel.is_admin(user_id):
+        return True, ""
+    ok, err, kw = db.check_access(user_id, cards_count)
+    if ok:
+        return True, ""
+    if err == "custom":
+        return False, kw["msg"]
+    if err == "banned" and not kw.get("reason"):
+        kw["reason"] = i18n.t(user_id, "ban_default_reason")
+    return False, i18n.t(user_id, f"err_{err}", **kw)
+
+
+def get_max_cards(user_id: int) -> int:
+    if admin_panel.is_admin(user_id):
+        return int(db.get_setting("global_max_cards", "100"))
+    return db.get_user_limits(user_id)[0]
+
+
+def get_card_delay(user_id: int) -> float:
+    if admin_panel.is_admin(user_id):
+        return float(db.get_setting("global_delay", "1.0"))
+    return db.get_user_limits(user_id)[1]
+
+
+def get_active_sessions() -> dict:
+    result = {}
+    for uid, stats in user_sessions.items():
+        if stats.get("is_running"):
+            user = db.get_user(uid) or {}
+            result[uid] = {
+                "checked": stats["cards_checked"],
+                "total": stats["total"],
+                "name": user.get("first_name") or str(uid),
+            }
+    return result
+
+
+def stop_user_check(user_id: int) -> None:
+    stats = get_user_stats(user_id)
+    if stats.get("is_running"):
+        stats["is_running"] = False
+        stats["last_response"] = "stopped_admin"
+
+
+def stop_all_checks() -> int:
+    n = 0
+    for uid in list(user_sessions.keys()):
+        if user_sessions[uid].get("is_running"):
+            stop_user_check(uid)
+            n += 1
+    return n
+
+
 def parse_cards(text: str) -> tuple[list[str], list[str]]:
     """يرجع (كروت صالحة، أسطر مرفوضة)"""
     valid, invalid = [], []
@@ -117,7 +178,7 @@ def get_user_stats(user_id: int) -> dict:
             "dashboard_message_id": None,
             "chat_id": None,
             "current_card": "",
-            "last_response": "في الانتظار...",
+            "last_response": "waiting",
             "cards_checked": 0,
             "success_cards": [],
         }
@@ -135,7 +196,7 @@ def reset_user_stats(user_id: int) -> None:
             "start_time": None,
             "is_running": False,
             "current_card": "",
-            "last_response": "في الانتظار...",
+            "last_response": "waiting",
             "cards_checked": 0,
             "success_cards": [],
         })
@@ -245,7 +306,7 @@ async def get_guid_with_retry(loop, stats: dict, max_retries: int = 2) -> str | 
             return match.group(1)
 
         log.warning("فشل جلب GUID — محاولة %d/%d", attempt + 1, max_retries)
-        stats["last_response"] = f"GUID Error — تجديد ({attempt + 1})"
+        stats["last_response"] = f"guid_retry:{attempt + 1}"
         await loop.run_in_executor(None, do_login)
         await asyncio.sleep(2)
 
@@ -274,7 +335,7 @@ async def check_card(card: str, bot_app, user_id: int) -> tuple[str, str]:
         guid = await get_guid_with_retry(loop, stats)
         if not guid:
             stats["errors"] += 1
-            stats["last_response"] = "GUID Error — فشل نهائي"
+            stats["last_response"] = "guid_error"
             return card, "ERROR"
 
         referer = f"{REALEX_BASE}/card.html?guid={guid}"
@@ -323,19 +384,19 @@ async def check_card(card: str, bot_app, user_id: int) -> tuple[str, str]:
         if encoded_creq.get("encodedCreq"):
             stats["success_3ds"] += 1
             stats["success_cards"].append(card)
-            stats["last_response"] = "3D LIVE ✅"
+            stats["last_response"] = "3d_live"
             await send_result(bot_app, card, "3D", user_id)
             return card, "3D"
 
         result_code = (data.get("data") or {}).get("response") or {}
         code = result_code.get("result", data.get("status", "?"))
         stats["failed"] += 1
-        stats["last_response"] = f"DECLINE ({code})"
+        stats["last_response"] = f"decline:{code}"
         return card, "DECLINE"
 
     except Exception as exc:
         stats["errors"] += 1
-        stats["last_response"] = f"Error: {str(exc)[:35]}"
+        stats["last_response"] = f"error:{str(exc)[:35]}"
         return card, "ERROR"
 
 
@@ -345,9 +406,9 @@ async def send_result(bot_app, card: str, status_type: str, user_id: int) -> Non
         return
 
     text = (
-        "✅ *3D SECURE LIVE*\n\n"
+        f"{i18n.t(user_id, 'result_3d_title')}\n\n"
         f"💳 `{card}`\n\n"
-        "🟢 Live — 3D Enrolled\n"
+        f"{i18n.t(user_id, 'result_3d_status')}\n"
         f"📊 {stats['cards_checked']}/{stats['total']}"
     )
     await bot_app.bot.send_message(
@@ -365,18 +426,18 @@ def _btn(text: str, callback: str = "noop", style: str | None = None) -> InlineK
     return InlineKeyboardButton(**kwargs)
 
 
-def _dash_status(stats: dict) -> tuple[str, str]:
-    if stats["last_response"] == "Completed ✅":
-        return "✅ اكتمل الفحص", "success"
-    if stats["last_response"] == "Stopped":
-        return "🛑 تم الإيقاف", "danger"
+def _dash_status(user_id: int, stats: dict) -> tuple[str, str]:
+    if stats["last_response"] == "completed":
+        return i18n.t(user_id, "status_completed"), "success"
+    if stats["last_response"] in ("stopped", "stopped_admin"):
+        return i18n.format_status(user_id, stats["last_response"]), "danger"
     if stats["is_running"]:
-        return "🟢 الفحص شغال", "success"
-    return "💤 في الانتظار", "primary"
+        return i18n.t(user_id, "status_running"), "success"
+    return i18n.t(user_id, "status_waiting"), "primary"
 
 
 def build_dashboard_text(user_id: int) -> str:
-    return "🌸 *DOBIES CHECKER*"
+    return i18n.t(user_id, "dash_title")
 
 
 def create_dashboard_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -387,35 +448,36 @@ def create_dashboard_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
     progress = (stats["cards_checked"] / stats["total"] * 100) if stats["total"] else 0
     speed = (stats["cards_checked"] / elapsed * 60) if elapsed > 0 else 0
-    status_text, status_style = _dash_status(stats)
+    status_text, status_style = _dash_status(user_id, stats)
+    last_disp = i18n.format_status(user_id, stats["last_response"])
 
     rows = [
         [_btn(status_text, style=status_style)],
-        [_btn(f"📦 الإجمالي: {stats['total']}", style="primary")],
-        [_btn(f"📊 التقدم: {stats['cards_checked']}/{stats['total']} ({progress:.0f}%)", style="primary")],
+        [_btn(i18n.t(user_id, "btn_total", n=stats["total"]), style="primary")],
+        [_btn(i18n.t(user_id, "btn_progress", done=stats["cards_checked"], total=stats["total"], pct=f"{progress:.0f}"), style="primary")],
         [
             _btn(f"⏱ {format_elapsed(elapsed)}", style="primary"),
-            _btn(f"🚀 {speed:.1f}/د", style="primary"),
+            _btn(i18n.t(user_id, "btn_speed", speed=f"{speed:.1f}"), style="primary"),
         ],
         [
-            _btn(f"✅ 3DS: {stats['success_3ds']}", style="success"),
-            _btn(f"❌ Decline: {stats['failed']}", style="danger"),
+            _btn(i18n.t(user_id, "btn_3ds", n=stats["success_3ds"]), style="success"),
+            _btn(i18n.t(user_id, "btn_decline", n=stats["failed"]), style="danger"),
         ],
-        [_btn(f"🚫 Errors: {stats['errors']}", style="danger")],
-        [_btn(f"📡 {stats['last_response'][:50]}", style="primary")],
+        [_btn(i18n.t(user_id, "btn_errors", n=stats["errors"]), style="danger")],
+        [_btn(f"📡 {last_disp[:50]}", style="primary")],
     ]
 
     if stats["current_card"]:
         rows.append([_btn(f"🔍 {stats['current_card']}", style="primary")])
 
     if stats["is_running"]:
-        rows.append([_btn("🛑 إيقاف الفحص", "stop_check", "danger")])
+        rows.append([_btn(i18n.t(user_id, "btn_stop"), "stop_check", "danger")])
     else:
-        rows.append([_btn("📤 أرسل ملف .txt للبدء", style="success")])
+        rows.append([_btn(i18n.t(user_id, "btn_send_file"), style="success")])
 
     rows.append([
-        _btn("🔄 تحديث", "refresh_dash", "primary"),
-        _btn("🔑 تجديد الجلسة", "reload_session", "primary"),
+        _btn(i18n.t(user_id, "btn_refresh"), "refresh_dash", "primary"),
+        _btn(i18n.t(user_id, "btn_reload"), "reload_session", "primary"),
     ])
 
     return InlineKeyboardMarkup(rows)
@@ -437,20 +499,64 @@ async def update_dashboard(bot_app, user_id: int) -> None:
         pass
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
+def language_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            _btn("📖 المساعدة", "help", "primary"),
-            _btn("📊 الحالة", "refresh_dash", "primary"),
+            _btn("🇸🇦 العربية", "lang:ar", "primary"),
+            _btn("🇬🇧 English", "lang:en", "primary"),
         ],
-        [_btn("🔑 تجديد الجلسة", "reload_session", "success")],
     ])
 
 
-def limit_cards(cards: list[str]) -> tuple[list[str], int]:
-    if len(cards) <= MAX_CARDS_PER_CHECK:
+def settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_btn(i18n.t(user_id, "settings_lang", lang=i18n.lang_label(user_id)), "noop", "primary")],
+        [
+            _btn(i18n.t(user_id, "btn_lang_ar"), "lang:ar", "success"),
+            _btn(i18n.t(user_id, "btn_lang_en"), "lang:en", "success"),
+        ],
+        [_btn(i18n.t(user_id, "btn_back"), "back_menu", "primary")],
+    ])
+
+
+def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            _btn(i18n.t(user_id, "btn_help"), "help", "primary"),
+            _btn(i18n.t(user_id, "btn_status"), "refresh_dash", "primary"),
+        ],
+        [
+            _btn(i18n.t(user_id, "btn_reload"), "reload_session", "success"),
+            _btn(i18n.t(user_id, "btn_settings"), "settings", "primary"),
+        ],
+    ]
+    if admin_panel.is_admin(user_id):
+        rows.append([_btn(i18n.t(user_id, "btn_admin"), "adm:main", "danger")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_language_picker(update: Update) -> None:
+    await update.effective_message.reply_text(
+        i18n.TEXTS["ar"]["choose_language"],
+        reply_markup=language_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+async def show_main_menu(update: Update, user_id: int) -> None:
+    mx = get_max_cards(user_id)
+    await update.effective_message.reply_text(
+        f"{i18n.t(user_id, 'welcome_title')}\n\n{i18n.t(user_id, 'welcome_body', max=mx)}",
+        reply_markup=main_menu_keyboard(user_id),
+        parse_mode="Markdown",
+    )
+
+
+def limit_cards(cards: list[str], user_id: int) -> tuple[list[str], int]:
+    max_cards = get_max_cards(user_id)
+    if len(cards) <= max_cards:
         return cards, 0
-    return cards[:MAX_CARDS_PER_CHECK], len(cards) - MAX_CARDS_PER_CHECK
+    return cards[:max_cards], len(cards) - max_cards
 
 
 # ========== PROCESS CARDS ==========
@@ -471,34 +577,41 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
         await update_dashboard(bot_app, user_id)
 
         if stats["is_running"] and stats["cards_checked"] < stats["total"]:
-            await asyncio.sleep(CARD_DELAY_SEC)
+            await asyncio.sleep(get_card_delay(user_id))
 
-    was_stopped = stats["last_response"] == "Stopped"
+    was_stopped = stats["cards_checked"] < stats["total"]
+    db.record_session(
+        user_id,
+        stats["cards_checked"],
+        stats["success_3ds"],
+        stats["failed"],
+        stats["errors"],
+    )
     stats["is_running"] = False
     stats["checking"] = 0
     stats["current_card"] = ""
-    stats["last_response"] = "Stopped" if was_stopped else "Completed ✅"
+    stats["last_response"] = "stopped" if was_stopped else "completed"
     await update_dashboard(bot_app, user_id)
 
     elapsed = int((datetime.now() - stats["start_time"]).total_seconds()) if stats["start_time"] else 0
-    title = "🛑 تم الإيقاف" if was_stopped else "✅ اكتمل الفحص"
+    title = i18n.t(user_id, "summary_stopped" if was_stopped else "summary_done")
     summary = (
         f"*{title}*\n\n"
-        f"📦 الإجمالي: `{stats['total']}`\n"
-        f"✅ 3DS Live: `{stats['success_3ds']}`\n"
-        f"❌ Declined: `{stats['failed']}`\n"
-        f"🚫 Errors: `{stats['errors']}`\n"
-        f"⏱ المدة: `{format_elapsed(elapsed)}`"
+        f"{i18n.t(user_id, 'summary_total', n=stats['total'])}\n"
+        f"{i18n.t(user_id, 'summary_3ds', n=stats['success_3ds'])}\n"
+        f"{i18n.t(user_id, 'summary_decline', n=stats['failed'])}\n"
+        f"{i18n.t(user_id, 'summary_errors', n=stats['errors'])}\n"
+        f"{i18n.t(user_id, 'summary_time', t=format_elapsed(elapsed))}"
     )
     await bot_app.bot.send_message(
         chat_id=stats["chat_id"],
         text=summary,
         reply_markup=InlineKeyboardMarkup([
             [
-                _btn(f"✅ 3DS: {stats['success_3ds']}", style="success"),
-                _btn(f"❌ Decline: {stats['failed']}", style="danger"),
+                _btn(i18n.t(user_id, "btn_3ds", n=stats["success_3ds"]), style="success"),
+                _btn(i18n.t(user_id, "btn_decline", n=stats["failed"]), style="danger"),
             ],
-            [_btn(f"🚫 Errors: {stats['errors']}", style="danger")],
+            [_btn(i18n.t(user_id, "btn_errors", n=stats["errors"]), style="danger")],
         ]),
         parse_mode="Markdown",
     )
@@ -512,7 +625,7 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
                 await bot_app.bot.send_document(
                     chat_id=stats["chat_id"],
                     document=doc,
-                    caption=f"✅ *3DS Live Cards* — {len(stats['success_cards'])} كرت",
+                    caption=i18n.t(user_id, "result_3d_file", n=len(stats["success_cards"])),
                     parse_mode="Markdown",
                 )
         finally:
@@ -521,19 +634,25 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
 
 async def start_check(update: Update, context: ContextTypes.DEFAULT_TYPE, cards: list[str]) -> None:
     user_id = update.effective_user.id
+    track_user(update)
     stats = get_user_stats(user_id)
+
+    allowed, reason = user_can_check(user_id, len(cards))
+    if not allowed:
+        await update.effective_message.reply_text(reason, parse_mode="Markdown")
+        return
 
     if stats["is_running"]:
         await update.effective_message.reply_text(
-            "⚠️ *في فحص شغال دلوقتي!*\nاضغط 🛑 إيقاف من لوحة التحكم أولاً.",
+            i18n.t(user_id, "checking_now"),
             parse_mode="Markdown",
         )
         return
 
-    cards, skipped = limit_cards(cards)
+    cards, skipped = limit_cards(cards, user_id)
     if skipped:
         await update.effective_message.reply_text(
-            f"⚠️ الحد الأقصى `{MAX_CARDS_PER_CHECK}` كرت — تم قص `{skipped}` كرت زيادة.",
+            i18n.t(user_id, "max_trimmed", max=get_max_cards(user_id), skipped=skipped),
             parse_mode="Markdown",
         )
 
@@ -555,40 +674,55 @@ async def start_check(update: Update, context: ContextTypes.DEFAULT_TYPE, cards:
 
 
 # ========== TELEGRAM HANDLERS ==========
-HELP_TEXT = (
-    "📖 *دليل الاستخدام*\n\n"
-    "📄 أرسل ملف `.txt` أو الصق الكروت في رسالة\n"
-    "📌 الصيغة: `number|MM|YYYY|CVV`\n\n"
-    f"🔢 الحد الأقصى: *{MAX_CARDS_PER_CHECK}* كرت في المرة\n"
-    "🐢 الفحص كرت كرت لتجنب الليمت\n\n"
-    "✅ بيبعت رسالة فقط لو *3D LIVE*\n"
-    "❌ الرفض مش بيبعت رسالة\n\n"
-    "/start — القائمة\n"
-    "/stop — إيقاف\n"
-    "/reload — تجديد الجلسة"
-)
+def build_help_text(user_id: int) -> str:
+    mx = db.get_setting("global_max_cards", "100")
+    return i18n.t(user_id, "help", max=mx)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user(update)
+    uid = update.effective_user.id
+    if not i18n.has_language(uid):
+        await show_language_picker(update)
+        return
+    await show_main_menu(update, uid)
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user(update)
+    uid = update.effective_user.id
+    if not i18n.has_language(uid):
+        await show_language_picker(update)
+        return
+    await update.message.reply_text(build_help_text(uid), parse_mode="Markdown")
+
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user(update)
+    uid = update.effective_user.id
+    if not i18n.has_language(uid):
+        await show_language_picker(update)
+        return
     await update.message.reply_text(
-        "🚀 *DOBIES CC CHECKER*\n\n"
-        "أرسل ملف `.txt` أو الصق الكروت مباشرة.\n"
-        f"الحد الأقصى *{MAX_CARDS_PER_CHECK}* كرت — فحص كرت كرت.",
-        reply_markup=main_menu_keyboard(),
+        f"{i18n.t(uid, 'settings_title')}\n\n{i18n.t(uid, 'settings_lang', lang=i18n.lang_label(uid))}",
+        reply_markup=settings_keyboard(uid),
         parse_mode="Markdown",
     )
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await admin_panel.admin_cmd(update, context, get_active_sessions)
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+    if not i18n.has_language(user_id):
+        await show_language_picker(update)
+        return
     stats = get_user_stats(user_id)
     if stats["dashboard_message_id"]:
         await update_dashboard(context.application, user_id)
-        await update.message.reply_text("📊 تم تحديث لوحة التحكم.")
+        await update.message.reply_text(i18n.t(user_id, "dash_updated"))
     else:
         await update.message.reply_text(
             build_dashboard_text(user_id),
@@ -602,46 +736,51 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await update.message.reply_text("🔄 جاري تجديد الجلسة...")
+    uid = update.effective_user.id
+    msg = await update.message.reply_text(i18n.t(uid, "reloading"))
     ok = await asyncio.get_running_loop().run_in_executor(None, do_login)
-    text = "✅ تم تجديد الجلسة بنجاح." if ok else "❌ فشل تجديد الجلسة."
+    text = i18n.t(uid, "reload_ok") if ok else i18n.t(uid, "reload_fail")
     await msg.edit_text(text)
 
 
 async def stop_check(user_id: int, bot_app, chat_id: int) -> None:
     stats = get_user_stats(user_id)
     if not stats["is_running"]:
-        await bot_app.bot.send_message(chat_id=chat_id, text="ℹ️ لا يوجد فحص شغال حالياً.")
+        await bot_app.bot.send_message(chat_id=chat_id, text=i18n.t(user_id, "no_active_check"))
         return
     stats["is_running"] = False
-    stats["last_response"] = "Stopped"
+    stats["last_response"] = "stopped"
     await update_dashboard(bot_app, user_id)
     await bot_app.bot.send_message(
         chat_id=chat_id,
-        text="🛑 *تم إيقاف الفحص*",
+        text=i18n.t(user_id, "check_stopped"),
         parse_mode="Markdown",
     )
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    track_user(update)
+    uid = update.effective_user.id
+    if not i18n.has_language(uid):
+        await show_language_picker(update)
+        return
+    allowed, reason = user_can_check(uid)
+    if not allowed:
+        await update.message.reply_text(reason, parse_mode="Markdown")
+        return
+
     file = await update.message.document.get_file()
     content = (await file.download_as_bytearray()).decode("utf-8", errors="ignore")
     valid, invalid = parse_cards(content)
 
     if not valid:
-        await update.message.reply_text(
-            "❌ الملف فاضي أو لا يحتوي كروت بصيغة صحيحة.\n"
-            "الصيغة: `number|MM|YYYY|CVV`",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(i18n.t(uid, "empty_file"), parse_mode="Markdown")
         return
 
-    note = ""
-    if invalid:
-        note = f"\n⚠️ تم تجاهل `{len(invalid)}` سطر بصيغة خاطئة."
+    note = i18n.t(uid, "invalid_lines", n=len(invalid)) if invalid else ""
 
     await update.message.reply_text(
-        f"✅ تم تحميل `{len(valid)}` كرت.{note}",
+        i18n.t(uid, "file_loaded", n=len(valid), note=note),
         parse_mode="Markdown",
     )
     await start_check(update, context, valid)
@@ -651,13 +790,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message or not update.message.text:
         return
 
+    if await admin_panel.handle_admin_input(update, context, context.application):
+        return
+
+    track_user(update)
+    uid = update.effective_user.id
+    if not i18n.has_language(uid):
+        await show_language_picker(update)
+        return
+    allowed, reason = user_can_check(uid)
+    if not allowed:
+        await update.message.reply_text(reason, parse_mode="Markdown")
+        return
+
     valid, invalid = parse_cards(update.message.text)
     if not valid:
         return
 
-    note = f" (تجاهل {len(invalid)} سطر)" if invalid else ""
+    note = i18n.t(uid, "ignore_lines", n=len(invalid)) if invalid else ""
     await update.message.reply_text(
-        f"✅ `{len(valid)}` كرت جاهز للفحص{note}",
+        i18n.t(uid, "cards_ready", n=len(valid), note=note),
         parse_mode="Markdown",
     )
     await start_check(update, context, valid)
@@ -672,26 +824,71 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         return
 
+    if data.startswith("adm:"):
+        await admin_panel.admin_callback(
+            update, context, get_active_sessions, stop_user_check, stop_all_checks,
+        )
+        return
+
+    if data.startswith("lang:"):
+        lang = data.split(":")[1]
+        if lang in i18n.LANGS:
+            first_time = not i18n.has_language(user_id)
+            db.set_user_language(user_id, lang)
+            track_user(update)
+            await query.answer()
+            confirm = i18n.t(user_id, "language_set_ar" if lang == "ar" else "language_set_en")
+            if first_time:
+                await query.edit_message_text(confirm, parse_mode="Markdown")
+                await show_main_menu(update, user_id)
+            else:
+                await query.edit_message_text(
+                    f"{confirm}\n\n{i18n.t(user_id, 'settings_title')}\n"
+                    f"{i18n.t(user_id, 'settings_lang', lang=i18n.lang_label(user_id))}",
+                    reply_markup=settings_keyboard(user_id),
+                    parse_mode="Markdown",
+                )
+        return
+
+    if data == "settings":
+        await query.answer()
+        await query.edit_message_text(
+            f"{i18n.t(user_id, 'settings_title')}\n\n{i18n.t(user_id, 'settings_lang', lang=i18n.lang_label(user_id))}",
+            reply_markup=settings_keyboard(user_id),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "back_menu":
+        await query.answer()
+        mx = get_max_cards(user_id)
+        await query.edit_message_text(
+            f"{i18n.t(user_id, 'welcome_title')}\n\n{i18n.t(user_id, 'welcome_body', max=mx)}",
+            reply_markup=main_menu_keyboard(user_id),
+            parse_mode="Markdown",
+        )
+        return
+
     if data == "help":
         await query.answer()
-        await query.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+        await query.message.reply_text(build_help_text(user_id), parse_mode="Markdown")
         return
 
     if data == "refresh_dash":
-        await query.answer("تم التحديث")
+        await query.answer(i18n.t(user_id, "refresh_ok"))
         await update_dashboard(context.application, user_id)
         return
 
     if data == "reload_session":
-        await query.answer("جاري التجديد...")
+        await query.answer(i18n.t(user_id, "reloading_short"))
         ok = await asyncio.get_running_loop().run_in_executor(None, do_login)
         await query.message.reply_text(
-            "✅ تم تجديد الجلسة." if ok else "❌ فشل تجديد الجلسة."
+            i18n.t(user_id, "reload_ok") if ok else i18n.t(user_id, "reload_fail")
         )
         return
 
     if data == "stop_check":
-        await query.answer("جاري الإيقاف...")
+        await query.answer(i18n.t(user_id, "stopping"))
         stats = get_user_stats(user_id)
         await stop_check(user_id, context.application, stats["chat_id"] or query.message.chat_id)
         return
@@ -738,6 +935,8 @@ def main() -> None:
         raise SystemExit(1)
 
     start_health_server()
+    db.init_db()
+    log.info("الأدمن: %s", admin_panel.ADMIN_IDS)
 
     log.info("جاري تسجيل الدخول الأولي...")
     if not do_login():
@@ -749,11 +948,13 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
+    app.add_handler(CommandHandler("settings", settings_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    log.info("البوت شغال — فحص تسلسلي، حد %d كرت", MAX_CARDS_PER_CHECK)
+    log.info("البوت شغال — فحص تسلسلي")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
