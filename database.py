@@ -71,7 +71,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
     if "language" not in cols:
         conn.execute("ALTER TABLE users ADD COLUMN language TEXT")
-        conn.commit()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "checker_mode" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN checker_mode TEXT")
+    conn.commit()
 
 
 def _today() -> str:
@@ -157,6 +160,29 @@ def set_user_language(user_id: int, language: str) -> None:
         )
         conn.commit()
         conn.close()
+
+
+def get_user_checker(user_id: int) -> str | None:
+    user = get_user(user_id)
+    if not user:
+        return None
+    mode = user.get("checker_mode")
+    return mode if mode in ("otp", "live") else None
+
+
+def set_user_checker(user_id: int, mode: str) -> None:
+    with _lock:
+        conn = _conn()
+        conn.execute(
+            "UPDATE users SET checker_mode = ? WHERE user_id = ?",
+            (mode, user_id),
+        )
+        conn.commit()
+        conn.close()
+
+
+def has_checker(user_id: int) -> bool:
+    return get_user_checker(user_id) in ("otp", "live")
 
 
 def _reset_daily_if_needed(conn: sqlite3.Connection, user_id: int) -> None:

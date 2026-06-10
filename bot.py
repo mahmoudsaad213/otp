@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 import admin_panel
 import database as db
 import i18n
+import live_checker
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -165,6 +166,27 @@ def format_elapsed(seconds: int) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def get_checker_mode(user_id: int) -> str:
+    return db.get_user_checker(user_id) or "otp"
+
+
+def is_live_mode(user_id: int) -> bool:
+    return get_checker_mode(user_id) == "live"
+
+
+async def ensure_checker_session(user_id: int, stats: dict) -> bool:
+    if is_live_mode(user_id):
+        return await live_checker.ensure_user_session(user_id, stats)
+    return await ensure_user_session(user_id, stats)
+
+
+def invalidate_checker_session(user_id: int) -> None:
+    if is_live_mode(user_id):
+        live_checker.invalidate_user_session(user_id)
+    else:
+        invalidate_user_session(user_id)
 
 
 def track_user(update: Update) -> None:
@@ -524,8 +546,8 @@ async def ensure_user_session(user_id: int, stats: dict) -> bool:
         return await _ensure_user_session_unlocked(user_id, stats)
 
 
-# ========== CARD CHECKER ==========
-async def check_card(card: str, bot_app, user_id: int, check_seq: int) -> tuple[str, str]:
+# ========== CARD CHECKER (OTP) ==========
+async def check_card_otp(card: str, bot_app, user_id: int, check_seq: int) -> tuple[str, str]:
     stats = get_user_stats(user_id)
     if not stats["is_running"]:
         return card, "STOPPED"
@@ -616,17 +638,47 @@ async def check_card(card: str, bot_app, user_id: int, check_seq: int) -> tuple[
             stats["active_card"] = ""
 
 
+async def run_single_check(card: str, bot_app, user_id: int, check_seq: int) -> tuple[str, str]:
+    stats = get_user_stats(user_id)
+    if is_live_mode(user_id):
+        status = await live_checker.check_card(card, user_id, stats, check_seq)
+        card_r, code = status
+        if code == "LIVE":
+            stats["success_3ds"] += 1
+            stats["success_cards"].append(card_r)
+            stats["last_response"] = "live_hit"
+            await send_result(bot_app, card_r, "LIVE", user_id)
+        elif code == "DECLINE":
+            stats["failed"] += 1
+            stats["last_response"] = "decline:card"
+        elif code == "BLOCKED":
+            stats["failed"] += 1
+            stats["last_response"] = "blocked"
+        elif code == "ERROR":
+            stats["errors"] += 1
+            stats["last_response"] = "error:live"
+        return card_r, code
+    return await check_card_otp(card, bot_app, user_id, check_seq)
+
+
 async def send_result(bot_app, card: str, status_type: str, user_id: int) -> None:
     stats = get_user_stats(user_id)
-    if status_type != "3D":
+    if status_type == "3D":
+        text = (
+            f"{i18n.t(user_id, 'result_3d_title')}\n\n"
+            f"💳 `{card}`\n\n"
+            f"{i18n.t(user_id, 'result_3d_status')}\n"
+            f"📊 {stats['cards_checked']}/{stats['total']}"
+        )
+    elif status_type == "LIVE":
+        text = (
+            f"{i18n.t(user_id, 'result_live_title')}\n\n"
+            f"💳 `{card}`\n\n"
+            f"{i18n.t(user_id, 'result_live_status')}\n"
+            f"📊 {stats['cards_checked']}/{stats['total']}"
+        )
+    else:
         return
-
-    text = (
-        f"{i18n.t(user_id, 'result_3d_title')}\n\n"
-        f"💳 `{card}`\n\n"
-        f"{i18n.t(user_id, 'result_3d_status')}\n"
-        f"📊 {stats['cards_checked']}/{stats['total']}"
-    )
     await bot_app.bot.send_message(
         chat_id=stats["chat_id"],
         text=text,
@@ -648,8 +700,10 @@ def _url_btn(text: str, url: str) -> InlineKeyboardButton:
 
 def build_welcome_text(user_id: int) -> str:
     mx = get_max_cards(user_id)
+    checker = i18n.checker_label(user_id)
     return (
         f"{i18n.t(user_id, 'welcome_title')}\n\n"
+        f"🎯 *{checker}*\n\n"
         f"{i18n.t(user_id, 'welcome_about')}\n\n"
         f"{i18n.t(user_id, 'welcome_body', max=mx)}\n\n"
         f"{i18n.t(user_id, 'links_block')}"
@@ -667,7 +721,26 @@ def _dash_status(user_id: int, stats: dict) -> tuple[str, str]:
 
 
 def build_dashboard_text(user_id: int) -> str:
-    return i18n.t(user_id, "dash_title")
+    key = "dash_title_live" if is_live_mode(user_id) else "dash_title_otp"
+    return i18n.t(user_id, key)
+
+
+def _success_btn(user_id: int, n: int) -> str:
+    if is_live_mode(user_id):
+        return i18n.t(user_id, "btn_live_hits", n=n)
+    return i18n.t(user_id, "btn_3ds", n=n)
+
+
+def _success_summary(user_id: int, n: int) -> str:
+    if is_live_mode(user_id):
+        return i18n.t(user_id, "summary_live", n=n)
+    return i18n.t(user_id, "summary_3ds", n=n)
+
+
+def _result_file_caption(user_id: int, n: int) -> str:
+    if is_live_mode(user_id):
+        return i18n.t(user_id, "result_live_file", n=n)
+    return i18n.t(user_id, "result_3d_file", n=n)
 
 
 def create_dashboard_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -690,7 +763,7 @@ def create_dashboard_keyboard(user_id: int) -> InlineKeyboardMarkup:
             _btn(i18n.t(user_id, "btn_speed", speed=f"{speed:.1f}"), style="primary"),
         ],
         [
-            _btn(i18n.t(user_id, "btn_3ds", n=stats["success_3ds"]), style="success"),
+            _btn(_success_btn(user_id, stats["success_3ds"]), style="success"),
             _btn(i18n.t(user_id, "btn_decline", n=stats["failed"]), style="danger"),
         ],
         [_btn(i18n.t(user_id, "btn_errors", n=stats["errors"]), style="danger")],
@@ -744,12 +817,34 @@ def language_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def checker_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            _btn("🔐 OTP CARD", "checker:otp", "primary"),
+            _btn("💳 LIVE CARD", "checker:live", "success"),
+        ],
+    ])
+
+
+async def show_checker_picker(update: Update, user_id: int) -> None:
+    await update.effective_message.reply_text(
+        i18n.t(user_id, "choose_checker"),
+        reply_markup=checker_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
 def settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [_btn(i18n.t(user_id, "settings_lang", lang=i18n.lang_label(user_id)), "noop", "primary")],
         [
             _btn(i18n.t(user_id, "btn_lang_ar"), "lang:ar", "success"),
             _btn(i18n.t(user_id, "btn_lang_en"), "lang:en", "success"),
+        ],
+        [_btn(i18n.t(user_id, "settings_checker", checker=i18n.checker_label(user_id)), "noop", "primary")],
+        [
+            _btn(i18n.t(user_id, "btn_checker_otp"), "checker:otp", "primary"),
+            _btn(i18n.t(user_id, "btn_checker_live"), "checker:live", "success"),
         ],
         [_btn(i18n.t(user_id, "btn_back"), "back_menu", "primary")],
     ])
@@ -806,7 +901,7 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
 
     stats["last_response"] = "session_retry:0"
     await update_dashboard(bot_app, user_id, force=True)
-    if not await ensure_user_session(user_id, stats):
+    if not await ensure_checker_session(user_id, stats):
         stats["is_running"] = False
         stats["last_response"] = "guid_error"
         await update_dashboard(bot_app, user_id, force=True)
@@ -829,16 +924,16 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
         stats["last_response"] = "running"
         await update_dashboard(bot_app, user_id, force=True)
 
-        result = await check_card(card, bot_app, user_id, seq)
+        result = await run_single_check(card, bot_app, user_id, seq)
 
         if result[1] == "ERROR" and stats["is_running"]:
-            invalidate_user_session(user_id)
-            if await ensure_user_session(user_id, stats):
+            invalidate_checker_session(user_id)
+            if await ensure_checker_session(user_id, stats):
                 stats["check_seq"] += 1
                 retry_seq = stats["check_seq"]
                 stats["current_card"] = mask_card(card)
                 stats["active_card"] = card
-                result = await check_card(card, bot_app, user_id, retry_seq)
+                result = await run_single_check(card, bot_app, user_id, retry_seq)
 
         stats["cards_checked"] += 1
         stats["checking"] = 0
@@ -869,7 +964,7 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
     summary = (
         f"*{title}*\n\n"
         f"{i18n.t(user_id, 'summary_total', n=stats['total'])}\n"
-        f"{i18n.t(user_id, 'summary_3ds', n=stats['success_3ds'])}\n"
+        f"{_success_summary(user_id, stats['success_3ds'])}\n"
         f"{i18n.t(user_id, 'summary_decline', n=stats['failed'])}\n"
         f"{i18n.t(user_id, 'summary_errors', n=stats['errors'])}\n"
         f"{i18n.t(user_id, 'summary_time', t=format_elapsed(elapsed))}"
@@ -879,7 +974,7 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
         text=summary,
         reply_markup=InlineKeyboardMarkup([
             [
-                _btn(i18n.t(user_id, "btn_3ds", n=stats["success_3ds"]), style="success"),
+                _btn(_success_btn(user_id, stats["success_3ds"]), style="success"),
                 _btn(i18n.t(user_id, "btn_decline", n=stats["failed"]), style="danger"),
             ],
             [_btn(i18n.t(user_id, "btn_errors", n=stats["errors"]), style="danger")],
@@ -889,14 +984,14 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
 
     if stats["success_cards"]:
         success_text = "\n".join(stats["success_cards"])
-        filename = Path(f"3ds_{user_id}_{int(datetime.now().timestamp())}.txt")
+        filename = Path(f"{'live' if is_live_mode(user_id) else '3ds'}_{user_id}_{int(datetime.now().timestamp())}.txt")
         filename.write_text(success_text, encoding="utf-8")
         try:
             with filename.open("rb") as doc:
                 await bot_app.bot.send_document(
                     chat_id=stats["chat_id"],
                     document=doc,
-                    caption=i18n.t(user_id, "result_3d_file", n=len(stats["success_cards"])),
+                    caption=_result_file_caption(user_id, len(stats["success_cards"])),
                     parse_mode="Markdown",
                 )
         finally:
@@ -906,6 +1001,11 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
 async def start_check(update: Update, context: ContextTypes.DEFAULT_TYPE, cards: list[str]) -> None:
     user_id = update.effective_user.id
     track_user(update)
+
+    if not db.has_checker(user_id):
+        await show_checker_picker(update, user_id)
+        return
+
     stats = get_user_stats(user_id)
 
     allowed, reason = user_can_check(user_id, len(cards))
@@ -954,8 +1054,17 @@ async def start_check(update: Update, context: ContextTypes.DEFAULT_TYPE, cards:
 
 # ========== TELEGRAM HANDLERS ==========
 def build_help_text(user_id: int) -> str:
+    if is_live_mode(user_id):
+        return i18n.t(user_id, "help_live")
     mx = db.get_setting("global_max_cards", "100")
     return i18n.t(user_id, "help", max=mx)
+
+
+async def _after_language_or_start(update: Update, user_id: int) -> None:
+    if not db.has_checker(user_id):
+        await show_checker_picker(update, user_id)
+        return
+    await show_main_menu(update, user_id)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -964,7 +1073,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not i18n.has_language(uid):
         await show_language_picker(update)
         return
-    await show_main_menu(update, uid)
+    await _after_language_or_start(update, uid)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -983,7 +1092,9 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await show_language_picker(update)
         return
     await update.message.reply_text(
-        f"{i18n.t(uid, 'settings_title')}\n\n{i18n.t(uid, 'settings_lang', lang=i18n.lang_label(uid))}",
+        f"{i18n.t(uid, 'settings_title')}\n\n"
+        f"{i18n.t(uid, 'settings_lang', lang=i18n.lang_label(uid))}\n"
+        f"{i18n.t(uid, 'settings_checker', checker=i18n.checker_label(uid))}",
         reply_markup=settings_keyboard(uid),
         parse_mode="Markdown",
     )
@@ -1017,9 +1128,9 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     msg = await update.message.reply_text(i18n.t(uid, "reloading"))
-    invalidate_user_session(uid)
+    invalidate_checker_session(uid)
     stats = get_user_stats(uid)
-    ok = await ensure_user_session(uid, stats)
+    ok = await ensure_checker_session(uid, stats)
     text = i18n.t(uid, "reload_ok") if ok else i18n.t(uid, "reload_fail")
     await msg.edit_text(text)
 
@@ -1121,20 +1232,48 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             confirm = i18n.t(user_id, "language_set_ar" if lang == "ar" else "language_set_en")
             if first_time:
                 await query.edit_message_text(confirm, parse_mode="Markdown")
-                await show_main_menu(update, user_id)
+                if not db.has_checker(user_id):
+                    await show_checker_picker(update, user_id)
+                else:
+                    await show_main_menu(update, user_id)
             else:
                 await query.edit_message_text(
                     f"{confirm}\n\n{i18n.t(user_id, 'settings_title')}\n"
-                    f"{i18n.t(user_id, 'settings_lang', lang=i18n.lang_label(user_id))}",
+                    f"{i18n.t(user_id, 'settings_lang', lang=i18n.lang_label(user_id))}\n"
+                    f"{i18n.t(user_id, 'settings_checker', checker=i18n.checker_label(user_id))}",
                     reply_markup=settings_keyboard(user_id),
                     parse_mode="Markdown",
                 )
         return
 
+    if data.startswith("checker:"):
+        mode = data.split(":")[1]
+        if mode in ("otp", "live"):
+            had_checker = db.has_checker(user_id)
+            db.set_user_checker(user_id, mode)
+            live_checker.invalidate_user_session(user_id)
+            invalidate_user_session(user_id)
+            await query.answer()
+            confirm = i18n.t(user_id, "checker_set_otp" if mode == "otp" else "checker_set_live")
+            if had_checker:
+                await query.edit_message_text(
+                    f"{confirm}\n\n{i18n.t(user_id, 'settings_title')}\n"
+                    f"{i18n.t(user_id, 'settings_lang', lang=i18n.lang_label(user_id))}\n"
+                    f"{i18n.t(user_id, 'settings_checker', checker=i18n.checker_label(user_id))}",
+                    reply_markup=settings_keyboard(user_id),
+                    parse_mode="Markdown",
+                )
+            else:
+                await query.edit_message_text(confirm, parse_mode="Markdown")
+                await show_main_menu(update, user_id)
+        return
+
     if data == "settings":
         await query.answer()
         await query.edit_message_text(
-            f"{i18n.t(user_id, 'settings_title')}\n\n{i18n.t(user_id, 'settings_lang', lang=i18n.lang_label(user_id))}",
+            f"{i18n.t(user_id, 'settings_title')}\n\n"
+            f"{i18n.t(user_id, 'settings_lang', lang=i18n.lang_label(user_id))}\n"
+            f"{i18n.t(user_id, 'settings_checker', checker=i18n.checker_label(user_id))}",
             reply_markup=settings_keyboard(user_id),
             parse_mode="Markdown",
         )
@@ -1162,9 +1301,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "reload_session":
         await query.answer(i18n.t(user_id, "reloading_short"))
-        invalidate_user_session(user_id)
+        invalidate_checker_session(user_id)
         stats = get_user_stats(user_id)
-        ok = await ensure_user_session(user_id, stats)
+        ok = await ensure_checker_session(user_id, stats)
         await query.message.reply_text(
             i18n.t(user_id, "reload_ok") if ok else i18n.t(user_id, "reload_fail")
         )

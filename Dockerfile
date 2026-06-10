@@ -9,6 +9,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py database.py admin_panel.py i18n.py .
+COPY bot.py database.py admin_panel.py i18n.py live_checker.py .
 
 CMD ["python", "-u", "bot.py"]

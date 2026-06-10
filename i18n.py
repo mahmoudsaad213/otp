@@ -14,6 +14,31 @@ LINK_CHAT = "https://t.me/facebook_method_tool"
 TEXTS: dict[str, dict[str, str]] = {
     "ar": {
         "choose_language": "🌍 *اختر لغتك*\n\nChoose your language:",
+        "choose_checker": "🎯 *اختر نوع الفحص*\n\n🔐 *OTP CARD* — فحص 3D Secure\n💳 *LIVE CARD* — فحص Live Stripe",
+        "checker_set_otp": "✅ تم اختيار *OTP CARD*",
+        "checker_set_live": "✅ تم اختيار *LIVE CARD*",
+        "settings_checker": "🎯 البوت الحالي: *{checker}*",
+        "checker_otp": "OTP CARD",
+        "checker_live": "LIVE CARD",
+        "btn_checker_otp": "🔐 OTP CARD",
+        "btn_checker_live": "💳 LIVE CARD",
+        "btn_change_checker": "🔄 تغيير البوت",
+        "dash_title_otp": "🔐 *OTP CARD*",
+        "dash_title_live": "💳 *LIVE CARD*",
+        "result_live_title": "✅ *LIVE CARD*",
+        "result_live_status": "🟢 Card Added Successfully",
+        "result_live_file": "✅ *LIVE Cards* — {n} كرت",
+        "status_live_hit": "LIVE ✅",
+        "status_blocked": "BLOCKED",
+        "summary_live": "✅ LIVE: `{n}`",
+        "btn_live_hits": "✅ LIVE: {n}",
+        "help_live": (
+            "📖 *LIVE CARD*\n\n"
+            "📄 أرسل `.txt` أو الصق الكروت\n"
+            "📌 `number|MM|YYYY|CVV`\n\n"
+            "✅ إشعار فقط لو *LIVE*\n"
+            "❌ Decline بدون إشعار"
+        ),
         "language_set_ar": "✅ تم تعيين اللغة: *العربية*",
         "language_set_en": "✅ Language set: *English*",
         "welcome_title": "🚀 *DOBIES CC CHECKER*",
@@ -108,6 +133,31 @@ TEXTS: dict[str, dict[str, str]] = {
     },
     "en": {
         "choose_language": "🌍 *Choose your language*\n\nاختر لغتك:",
+        "choose_checker": "🎯 *Choose checker*\n\n🔐 *OTP CARD* — 3D Secure check\n💳 *LIVE CARD* — Stripe Live check",
+        "checker_set_otp": "✅ Selected *OTP CARD*",
+        "checker_set_live": "✅ Selected *LIVE CARD*",
+        "settings_checker": "🎯 Current bot: *{checker}*",
+        "checker_otp": "OTP CARD",
+        "checker_live": "LIVE CARD",
+        "btn_checker_otp": "🔐 OTP CARD",
+        "btn_checker_live": "💳 LIVE CARD",
+        "btn_change_checker": "🔄 Change bot",
+        "dash_title_otp": "🔐 *OTP CARD*",
+        "dash_title_live": "💳 *LIVE CARD*",
+        "result_live_title": "✅ *LIVE CARD*",
+        "result_live_status": "🟢 Card Added Successfully",
+        "result_live_file": "✅ *LIVE Cards* — {n} cards",
+        "status_live_hit": "LIVE ✅",
+        "status_blocked": "BLOCKED",
+        "summary_live": "✅ LIVE: `{n}`",
+        "btn_live_hits": "✅ LIVE: {n}",
+        "help_live": (
+            "📖 *LIVE CARD*\n\n"
+            "📄 Send `.txt` or paste cards\n"
+            "📌 `number|MM|YYYY|CVV`\n\n"
+            "✅ Notifies only on *LIVE*\n"
+            "❌ Declines are silent"
+        ),
         "language_set_ar": "✅ Language set: *Arabic*",
         "language_set_en": "✅ Language set: *English*",
         "welcome_title": "🚀 *DOBIES CC CHECKER*",
@@ -225,6 +275,15 @@ def lang_label(user_id: int) -> str:
     return t(user_id, "lang_ar" if lang == "ar" else "lang_en")
 
 
+def checker_label(user_id: int, mode: str | None = None) -> str:
+    mode = mode or db.get_user_checker(user_id) or "otp"
+    return t(user_id, "checker_live" if mode == "live" else "checker_otp")
+
+
+def is_live_mode(user_id: int) -> bool:
+    return db.get_user_checker(user_id) == "live"
+
+
 def format_status(user_id: int, code: str) -> str:
     if code.startswith("decline:"):
         return f"DECLINE ({code.split(':', 1)[1]})"
@@ -242,6 +301,8 @@ def format_status(user_id: int, code: str) -> str:
         "stopped": "status_stopped",
         "stopped_admin": "status_stopped_admin",
         "3d_live": "status_3d",
+        "live_hit": "status_live_hit",
+        "blocked": "status_blocked",
         "guid_error": "status_waiting",
     }
     key = known.get(code)
