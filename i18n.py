@@ -103,6 +103,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "err_daily_limit": "📅 تجاوزت الحد اليومي `{limit}` كرت.\nالمتبقي: `{remaining}`",
         "ban_default_reason": "مخالفة القواعد",
         "err_queue_full": "⏳ السيرفر مزدحم ({active}/{max}) — حاول بعد دقيقة.",
+        "session_failed": "❌ *فشل تجهيز الجلسة*\nحاول مرة أخرى أو /reload",
+        "status_session": "🔄 تجديد الجلسة ({n})",
     },
     "en": {
         "choose_language": "🌍 *Choose your language*\n\nاختر لغتك:",
@@ -195,6 +197,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "err_daily_limit": "📅 Daily limit `{limit}` exceeded.\nRemaining: `{remaining}`",
         "ban_default_reason": "Rule violation",
         "err_queue_full": "⏳ Server busy ({active}/{max}) — try again in a minute.",
+        "session_failed": "❌ *Session setup failed*\nTry again or /reload",
+        "status_session": "🔄 Renewing session ({n})",
     },
 }
 
@@ -228,7 +232,10 @@ def format_status(user_id: int, code: str) -> str:
         return f"Error: {code.split(':', 1)[1]}"
     if code.startswith("guid_retry:"):
         return f"GUID Error — retry ({code.split(':', 1)[1]})"
+    if code.startswith("session_retry:"):
+        return t(user_id, "status_session", n=code.split(":", 1)[1])
     known = {
+        "running": "status_running",
         "waiting": "status_waiting",
         "running": "status_running",
         "completed": "status_completed",

