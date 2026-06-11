@@ -8,6 +8,12 @@ from datetime import date, datetime
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 _lock = threading.Lock()
 
+
+def _ensure_db_dir() -> None:
+    folder = os.path.dirname(os.path.abspath(DB_PATH))
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
 DEFAULT_SETTINGS = {
     "maintenance_mode": "0",
     "maintenance_message": "🔧 البوت في وضع الصيانة حالياً. حاول لاحقاً.",
@@ -26,6 +32,7 @@ def _conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    _ensure_db_dir()
     with _lock:
         conn = _conn()
         conn.executescript(
@@ -447,6 +454,25 @@ def get_broadcast_targets() -> list[int]:
         ).fetchall()
         conn.close()
     return [r["user_id"] for r in rows]
+
+
+def create_db_backup(dest_path: str) -> bool:
+    """Safe SQLite backup while the bot is running."""
+    _ensure_db_dir()
+    with _lock:
+        if not os.path.isfile(DB_PATH):
+            return False
+        src = _conn()
+        try:
+            dst = sqlite3.connect(dest_path)
+            try:
+                src.backup(dst)
+                dst.commit()
+            finally:
+                dst.close()
+        finally:
+            src.close()
+    return True
 
 
 def format_user_label(user: dict) -> str:

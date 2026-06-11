@@ -2,7 +2,9 @@
 """Telegram admin control panel."""
 import asyncio
 import os
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
@@ -57,6 +59,7 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
             )
         ],
         [_btn("📢 رسالة جماعية", "adm:bc", "primary")],
+        [_btn("💾 نسخة احتياطية للبيانات", "adm:bak", "primary")],
         [_btn("🛑 إيقاف كل الفحوصات", "adm:kill", "danger")],
         [_btn("🔄 تحديث اللوحة", "adm:main", "primary")],
     ])
@@ -503,6 +506,25 @@ async def admin_callback(
             text = "\n".join(lines)
             kb = InlineKeyboardMarkup(rows)
         await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+        return
+
+    if action == "bak":
+        await query.answer("جاري إنشاء النسخة...")
+        tmp = Path(tempfile.gettempdir()) / f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        if not db.create_db_backup(str(tmp)):
+            await query.message.reply_text("❌ ملف قاعدة البيانات غير موجود.")
+            return
+        try:
+            with tmp.open("rb") as fh:
+                await context.bot.send_document(
+                    chat_id=query.from_user.id,
+                    document=fh,
+                    filename=tmp.name,
+                    caption=f"💾 نسخة احتياطية — {db.count_users()} مستخدم",
+                )
+            await query.message.reply_text("✅ تم إرسال النسخة الاحتياطية في الخاص.")
+        finally:
+            tmp.unlink(missing_ok=True)
         return
 
     # ── stop all ──
