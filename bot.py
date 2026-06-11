@@ -215,9 +215,12 @@ def get_max_cards(user_id: int) -> int:
 
 
 def get_card_delay(user_id: int) -> float:
+    mode = get_checker_mode(user_id)
     if admin_panel.is_admin(user_id):
-        return float(db.get_setting("global_delay", "1.0"))
-    return db.get_user_limits(user_id)[1]
+        key = "live_delay" if mode == "live" else "global_delay"
+        default = "2.0" if mode == "live" else "1.0"
+        return float(db.get_setting(key, default))
+    return db.get_checker_delay(user_id, mode)
 
 
 def get_active_sessions() -> dict:
@@ -654,7 +657,7 @@ async def run_single_check(card: str, bot_app, user_id: int, check_seq: int) -> 
         elif code == "BLOCKED":
             stats["failed"] += 1
             stats["last_response"] = "blocked"
-        elif code == "ERROR":
+        elif code in ("ERROR", "SESSION_ERROR"):
             stats["errors"] += 1
             stats["last_response"] = "error:live"
         return card_r, code
@@ -926,7 +929,10 @@ async def process_cards(cards: list[str], bot_app, user_id: int) -> None:
 
         result = await run_single_check(card, bot_app, user_id, seq)
 
-        if result[1] == "ERROR" and stats["is_running"]:
+        retry_session = result[1] == "SESSION_ERROR" or (
+            not is_live_mode(user_id) and result[1] == "ERROR"
+        )
+        if retry_session and stats["is_running"]:
             invalidate_checker_session(user_id)
             if await ensure_checker_session(user_id, stats):
                 stats["check_seq"] += 1

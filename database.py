@@ -13,6 +13,7 @@ DEFAULT_SETTINGS = {
     "maintenance_message": "🔧 البوت في وضع الصيانة حالياً. حاول لاحقاً.",
     "global_max_cards": "100",
     "global_delay": "1.0",
+    "live_delay": "2.0",
     "default_daily_limit": "0",
     "bot_enabled": "1",
 }
@@ -362,19 +363,32 @@ def record_session(
         conn.close()
 
 
+def get_checker_delay(user_id: int, checker_mode: str | None = None) -> float:
+    """Delay between cards for the given checker mode."""
+    settings = get_settings()
+    user = get_user(user_id)
+    if checker_mode is None:
+        checker_mode = (user or {}).get("checker_mode") or "otp"
+
+    if user and user["custom_delay"] is not None:
+        return float(user["custom_delay"])
+
+    key = "live_delay" if checker_mode == "live" else "global_delay"
+    return float(settings.get(key, "1.0"))
+
+
 def get_user_limits(user_id: int) -> tuple[int, float, int]:
     """max_cards, delay, daily_limit (0 = unlimited)"""
     settings = get_settings()
     global_max = int(settings["global_max_cards"])
-    global_delay = float(settings["global_delay"])
     default_daily = int(settings["default_daily_limit"])
 
     user = get_user(user_id)
     if not user:
-        return global_max, global_delay, default_daily
+        return global_max, get_checker_delay(user_id), default_daily
 
     max_cards = user["custom_max_cards"] if user["custom_max_cards"] is not None else global_max
-    delay = user["custom_delay"] if user["custom_delay"] is not None else global_delay
+    delay = get_checker_delay(user_id, user.get("checker_mode") or "otp")
     daily = user["daily_limit"] if user["daily_limit"] is not None else default_daily
     return max_cards, delay, daily
 

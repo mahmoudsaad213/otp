@@ -77,7 +77,7 @@ def admin_stats_text(active_count: int) -> str:
         f"❌ Decline: `{g['total_failed']}`\n"
         f"🚫 Errors: `{g['total_errors']}`\n\n"
         f"🔢 حد الكروت: `{s['global_max_cards']}`\n"
-        f"⏱ التأخير: `{s['global_delay']}ث`\n"
+        f"⏱ OTP: `{s['global_delay']}ث` | LIVE: `{s.get('live_delay', '2.0')}ث`\n"
         f"📅 حد يومي: `{s['default_daily_limit'] or '∞'}`\n"
         f"🔧 صيانة: `{'ON' if s['maintenance_mode'] == '1' else 'OFF'}`"
     )
@@ -87,6 +87,7 @@ def admin_settings_keyboard() -> InlineKeyboardMarkup:
     s = db.get_settings()
     mx = int(s["global_max_cards"])
     dy = float(s["global_delay"])
+    ldy = float(s.get("live_delay", "2.0"))
     dl = int(s["default_daily_limit"])
     bot_on = s["bot_enabled"] == "1"
     return InlineKeyboardMarkup([
@@ -97,12 +98,22 @@ def admin_settings_keyboard() -> InlineKeyboardMarkup:
             _btn("50", "adm:mx:50", "primary"),
             _btn("100", "adm:mx:100", "primary"),
         ],
-        [_btn(f"⏱ التأخير: {dy}ث", "noop", "primary")],
+        [_btn(f"⏱ OTP — {dy}ث", "noop", "primary")],
         [
-            _btn("0.5ث", "adm:dy:0.5", "primary"),
-            _btn("1ث", "adm:dy:1", "primary"),
-            _btn("2ث", "adm:dy:2", "primary"),
-            _btn("5ث", "adm:dy:5", "primary"),
+            _btn("0", "adm:dy:0", "primary"),
+            _btn("0.5", "adm:dy:0.5", "primary"),
+            _btn("1", "adm:dy:1", "primary"),
+            _btn("2", "adm:dy:2", "primary"),
+            _btn("5", "adm:dy:5", "primary"),
+        ],
+        [_btn(f"⏱ LIVE — {ldy}ث", "noop", "primary")],
+        [
+            _btn("0", "adm:ldy:0", "primary"),
+            _btn("0.5", "adm:ldy:0.5", "primary"),
+            _btn("1", "adm:ldy:1", "primary"),
+            _btn("2", "adm:ldy:2", "primary"),
+            _btn("3", "adm:ldy:3", "primary"),
+            _btn("5", "adm:ldy:5", "primary"),
         ],
         [_btn(f"📅 الحد اليومي: {dl or '∞'}", "noop", "primary")],
         [
@@ -405,7 +416,17 @@ async def admin_callback(
 
     if action == "dy":
         db.set_setting("global_delay", parts[2])
-        await query.answer(f"التأخير: {parts[2]}ث")
+        await query.answer(f"OTP: {parts[2]}ث")
+        await query.edit_message_text(
+            "⚙️ *الإعدادات العامة*",
+            reply_markup=admin_settings_keyboard(),
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "ldy":
+        db.set_setting("live_delay", parts[2])
+        await query.answer(f"LIVE: {parts[2]}ث")
         await query.edit_message_text(
             "⚙️ *الإعدادات العامة*",
             reply_markup=admin_settings_keyboard(),
