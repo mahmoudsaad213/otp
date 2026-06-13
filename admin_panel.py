@@ -163,6 +163,7 @@ def user_detail_keyboard(uid: int) -> InlineKeyboardMarkup:
     user = db.get_user(uid) or {}
     banned = user.get("is_banned")
     suspended = user.get("is_suspended")
+    otp_adv = bool(user.get("otp_advanced"))
     rows = [
         [
             _btn("✅ رفع الحظر" if banned else "🚫 حظر", f"adm:ub:{uid}" if banned else f"adm:bn:{uid}", "success" if banned else "danger"),
@@ -171,6 +172,13 @@ def user_detail_keyboard(uid: int) -> InlineKeyboardMarkup:
         [_btn("🔢 تعديل حد الكروت", f"adm:ulm:{uid}", "primary")],
         [_btn("⏱ تعديل التأخير", f"adm:udl:{uid}", "primary")],
         [_btn("📅 تعديل الحد اليومي", f"adm:udlm:{uid}", "primary")],
+        [
+            _btn(
+                "🔬 إيقاف التحقق المتقدم" if otp_adv else "🔬 تفعيل التحقق المتقدم",
+                f"adm:oadv:{uid}:{0 if otp_adv else 1}",
+                "success" if otp_adv else "primary",
+            )
+        ],
         [_btn("🛑 إيقاف فحصه", f"adm:stp:{uid}", "danger")],
         [_btn("📩 رسالة خاصة", f"adm:msg:{uid}", "primary")],
         [_btn("🗑 تصفير إحصائياته", f"adm:rst:{uid}", "danger")],
@@ -187,6 +195,7 @@ def user_detail_text(uid: int) -> str:
     custom_mx = "افتراضي" if user["custom_max_cards"] is None else str(user["custom_max_cards"])
     custom_dy = "افتراضي" if user["custom_delay"] is None else f"{user['custom_delay']}ث"
     custom_dl = "افتراضي" if user["daily_limit"] is None else (str(user["daily_limit"]) if user["daily_limit"] else "∞")
+    otp_adv = "مفعّل" if user.get("otp_advanced") else "متوقف"
     la = user["last_active"] or "—"
     if len(la) > 19:
         la = la[:19]
@@ -203,6 +212,7 @@ def user_detail_text(uid: int) -> str:
         f"🔢 حد الكروت: `{custom_mx}` (فعّال: {mx})\n"
         f"⏱ التأخير: `{custom_dy}` (فعّال: {dy}ث)\n"
         f"📅 حد يومي: `{custom_dl}`\n"
+        f"🔬 تحقق متقدم OTP: `{otp_adv}`\n"
         f"🕐 آخر نشاط: `{la}`"
     )
 
@@ -351,6 +361,18 @@ async def admin_callback(
         uid = int(parts[2])
         db.reset_user_stats_db(uid)
         await query.answer("تم تصفير الإحصائيات")
+        await query.edit_message_text(
+            user_detail_text(uid),
+            reply_markup=user_detail_keyboard(uid),
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "oadv" and len(parts) >= 4:
+        uid = int(parts[2])
+        enabled = parts[3] == "1"
+        db.set_user_otp_advanced(uid, enabled)
+        await query.answer("تم تحديث التحقق المتقدم")
         await query.edit_message_text(
             user_detail_text(uid),
             reply_markup=user_detail_keyboard(uid),

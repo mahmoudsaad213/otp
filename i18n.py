@@ -130,6 +130,22 @@ TEXTS: dict[str, dict[str, str]] = {
         "err_queue_full": "⏳ السيرفر مزدحم ({active}/{max}) — حاول بعد دقيقة.",
         "session_failed": "❌ *فشل تجهيز الجلسة*\nحاول مرة أخرى أو /reload",
         "status_session": "🔄 تجديد الجلسة ({n})",
+        "settings_otp_advanced": "🔬 تحقق متقدم: *{state}*",
+        "otp_advanced_on": "مفعّل",
+        "otp_advanced_off": "متوقف",
+        "btn_otp_advanced_on": "🔬 تفعيل التحقق المتقدم",
+        "btn_otp_advanced_off": "🔬 إيقاف التحقق المتقدم",
+        "otp_advanced_enabled_msg": "✅ تم *تفعيل* التحقق المتقدم\n\nيفحص صفحة 3DS الحقيقية ويميّز بين:\n• 3D كامل (OTP / Push / SMS)\n• فشل Authentication",
+        "otp_advanced_disabled_msg": "✅ تم *إيقاف* التحقق المتقدم\n\nيرجع للفحص العادي (Enrolled فقط).",
+        "result_3d_advanced_status": "🟢 3D Full — {method}",
+        "status_adv_auth_failed": "3D Auth Failed ❌",
+        "status_adv_unclear": "3D غير واضح",
+        "status_adv_fetch_error": "Advanced Fetch Error",
+        "help_otp_advanced": (
+            "\n\n🔬 *التحقق المتقدم* (OTP فقط):\n"
+            "يفتح صفحة Arcot ويتحقق هل الكرت *3D كامل* أم *Authentication Failed*.\n"
+            "فعّله من ⚙️ الإعدادات."
+        ),
     },
     "en": {
         "choose_language": "🌍 *Choose your language*\n\nاختر لغتك:",
@@ -249,6 +265,22 @@ TEXTS: dict[str, dict[str, str]] = {
         "err_queue_full": "⏳ Server busy ({active}/{max}) — try again in a minute.",
         "session_failed": "❌ *Session setup failed*\nTry again or /reload",
         "status_session": "🔄 Renewing session ({n})",
+        "settings_otp_advanced": "🔬 Advanced verify: *{state}*",
+        "otp_advanced_on": "ON",
+        "otp_advanced_off": "OFF",
+        "btn_otp_advanced_on": "🔬 Enable advanced verify",
+        "btn_otp_advanced_off": "🔬 Disable advanced verify",
+        "otp_advanced_enabled_msg": "✅ *Advanced verification enabled*\n\nChecks the real 3DS page and distinguishes:\n• Full 3D (OTP / Push / SMS)\n• Authentication failed",
+        "otp_advanced_disabled_msg": "✅ *Advanced verification disabled*\n\nBack to basic enrolled-only check.",
+        "result_3d_advanced_status": "🟢 3D Full — {method}",
+        "status_adv_auth_failed": "3D Auth Failed ❌",
+        "status_adv_unclear": "3D unclear",
+        "status_adv_fetch_error": "Advanced fetch error",
+        "help_otp_advanced": (
+            "\n\n🔬 *Advanced verification* (OTP only):\n"
+            "Opens the Arcot page to tell *full 3D* from *Authentication Failed*.\n"
+            "Enable it in ⚙️ Settings."
+        ),
     },
 }
 
@@ -303,6 +335,9 @@ def format_status(user_id: int, code: str) -> str:
         "3d_live": "status_3d",
         "live_hit": "status_live_hit",
         "blocked": "status_blocked",
+        "adv_auth_failed": "status_adv_auth_failed",
+        "adv_unclear": "status_adv_unclear",
+        "adv_fetch_error": "status_adv_fetch_error",
         "guid_error": "status_waiting",
     }
     key = known.get(code)

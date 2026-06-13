@@ -20,6 +20,7 @@ import admin_panel
 import database as db
 import i18n
 import live_checker
+import otp_advanced
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -619,6 +620,31 @@ async def check_card_otp(card: str, bot_app, user_id: int, check_seq: int) -> tu
 
         encoded_creq = (data.get("data") or {}).get("verifyEnrolledResult") or {}
         if encoded_creq.get("encodedCreq"):
+            if is_otp_advanced(user_id):
+                _, analysis = await run_blocking(
+                    otp_advanced.fetch_arcot_challenge,
+                    encoded_creq,
+                    referer,
+                )
+                if analysis.verdict == "FULL_3D":
+                    stats["success_3ds"] += 1
+                    stats["success_cards"].append(card)
+                    stats["last_response"] = "3d_live"
+                    method = otp_advanced.method_label(analysis.method)
+                    await send_result(bot_app, card, "3D", user_id, advanced_method=method)
+                    return card, "3D"
+                if analysis.verdict == "AUTH_FAILED":
+                    stats["failed"] += 1
+                    stats["last_response"] = "adv_auth_failed"
+                    return card, "DECLINE"
+                if analysis.verdict == "FETCH_ERROR":
+                    stats["errors"] += 1
+                    stats["last_response"] = "adv_fetch_error"
+                    return card, "ERROR"
+                stats["failed"] += 1
+                stats["last_response"] = "adv_unclear"
+                return card, "DECLINE"
+
             stats["success_3ds"] += 1
             stats["success_cards"].append(card)
             stats["last_response"] = "3d_live"
@@ -664,13 +690,24 @@ async def run_single_check(card: str, bot_app, user_id: int, check_seq: int) -> 
     return await check_card_otp(card, bot_app, user_id, check_seq)
 
 
-async def send_result(bot_app, card: str, status_type: str, user_id: int) -> None:
+async def send_result(
+    bot_app,
+    card: str,
+    status_type: str,
+    user_id: int,
+    advanced_method: str = "",
+) -> None:
     stats = get_user_stats(user_id)
     if status_type == "3D":
+        status_line = (
+            i18n.t(user_id, "result_3d_advanced_status", method=advanced_method)
+            if advanced_method
+            else i18n.t(user_id, "result_3d_status")
+        )
         text = (
             f"{i18n.t(user_id, 'result_3d_title')}\n\n"
             f"💳 `{card}`\n\n"
-            f"{i18n.t(user_id, 'result_3d_status')}\n"
+            f"{status_line}\n"
             f"📊 {stats['cards_checked']}/{stats['total']}"
         )
     elif status_type == "LIVE":
@@ -837,8 +874,17 @@ async def show_checker_picker(update: Update, user_id: int) -> None:
     )
 
 
+def is_otp_advanced(user_id: int) -> bool:
+    return not is_live_mode(user_id) and db.get_user_otp_advanced(user_id)
+
+
+def otp_advanced_state_label(user_id: int) -> str:
+    key = "otp_advanced_on" if is_otp_advanced(user_id) else "otp_advanced_off"
+    return i18n.t(user_id, key)
+
+
 def settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    rows = [
         [_btn(i18n.t(user_id, "settings_lang", lang=i18n.lang_label(user_id)), "noop", "primary")],
         [
             _btn(i18n.t(user_id, "btn_lang_ar"), "lang:ar", "success"),
@@ -849,8 +895,23 @@ def settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
             _btn(i18n.t(user_id, "btn_checker_otp"), "checker:otp", "primary"),
             _btn(i18n.t(user_id, "btn_checker_live"), "checker:live", "success"),
         ],
-        [_btn(i18n.t(user_id, "btn_back"), "back_menu", "primary")],
-    ])
+    ]
+    if not is_live_mode(user_id):
+        adv_btn = (
+            i18n.t(user_id, "btn_otp_advanced_off")
+            if is_otp_advanced(user_id)
+            else i18n.t(user_id, "btn_otp_advanced_on")
+        )
+        rows.append([_btn(adv_btn, "otp_adv:toggle", "primary")])
+        rows.append([
+            _btn(
+                i18n.t(user_id, "settings_otp_advanced", state=otp_advanced_state_label(user_id)),
+                "noop",
+                "primary",
+            )
+        ])
+    rows.append([_btn(i18n.t(user_id, "btn_back"), "back_menu", "primary")])
+    return InlineKeyboardMarkup(rows)
 
 
 def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -1063,7 +1124,7 @@ def build_help_text(user_id: int) -> str:
     if is_live_mode(user_id):
         return i18n.t(user_id, "help_live")
     mx = db.get_setting("global_max_cards", "100")
-    return i18n.t(user_id, "help", max=mx)
+    return i18n.t(user_id, "help", max=mx) + i18n.t(user_id, "help_otp_advanced")
 
 
 async def _after_language_or_start(update: Update, user_id: int) -> None:
@@ -1276,10 +1337,34 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "settings":
         await query.answer()
+        lines = [
+            i18n.t(user_id, "settings_title"),
+            "",
+            i18n.t(user_id, "settings_lang", lang=i18n.lang_label(user_id)),
+            i18n.t(user_id, "settings_checker", checker=i18n.checker_label(user_id)),
+        ]
+        if not is_live_mode(user_id):
+            lines.append(i18n.t(user_id, "settings_otp_advanced", state=otp_advanced_state_label(user_id)))
         await query.edit_message_text(
-            f"{i18n.t(user_id, 'settings_title')}\n\n"
+            "\n".join(lines),
+            reply_markup=settings_keyboard(user_id),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "otp_adv:toggle":
+        if is_live_mode(user_id):
+            await query.answer("OTP only", show_alert=True)
+            return
+        enabled = not is_otp_advanced(user_id)
+        db.set_user_otp_advanced(user_id, enabled)
+        await query.answer()
+        msg = i18n.t(user_id, "otp_advanced_enabled_msg" if enabled else "otp_advanced_disabled_msg")
+        await query.edit_message_text(
+            f"{msg}\n\n{i18n.t(user_id, 'settings_title')}\n"
             f"{i18n.t(user_id, 'settings_lang', lang=i18n.lang_label(user_id))}\n"
-            f"{i18n.t(user_id, 'settings_checker', checker=i18n.checker_label(user_id))}",
+            f"{i18n.t(user_id, 'settings_checker', checker=i18n.checker_label(user_id))}\n"
+            f"{i18n.t(user_id, 'settings_otp_advanced', state=otp_advanced_state_label(user_id))}",
             reply_markup=settings_keyboard(user_id),
             parse_mode="Markdown",
         )

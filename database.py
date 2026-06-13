@@ -82,6 +82,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
     if "checker_mode" not in cols:
         conn.execute("ALTER TABLE users ADD COLUMN checker_mode TEXT")
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "otp_advanced" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN otp_advanced INTEGER DEFAULT 0")
     conn.commit()
 
 
@@ -184,6 +187,22 @@ def set_user_checker(user_id: int, mode: str) -> None:
         conn.execute(
             "UPDATE users SET checker_mode = ? WHERE user_id = ?",
             (mode, user_id),
+        )
+        conn.commit()
+        conn.close()
+
+
+def get_user_otp_advanced(user_id: int) -> bool:
+    user = get_user(user_id)
+    return bool(user and user.get("otp_advanced"))
+
+
+def set_user_otp_advanced(user_id: int, enabled: bool) -> None:
+    with _lock:
+        conn = _conn()
+        conn.execute(
+            "UPDATE users SET otp_advanced = ? WHERE user_id = ?",
+            (1 if enabled else 0, user_id),
         )
         conn.commit()
         conn.close()
